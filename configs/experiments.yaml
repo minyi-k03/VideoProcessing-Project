@@ -1,0 +1,88 @@
+# 실험 구성 목록 (SPEC.md / ADR-0004)
+# 허용 키는 trainable 및 개선 스위치(A, B, C, Bp)뿐이며,
+# 공정 비교 조건 키를 포함하면 실행 전 검증에서 거부됩니다.
+
+configs:
+  bicubic:
+    trainable: false
+    switches:
+      A: false
+      B: false
+      C: false
+      Bp: false
+
+  baseline:
+    trainable: true
+    switches:
+      A: false
+      B: false
+      C: false
+      Bp: false
+
+  A:
+    trainable: true
+    switches:
+      A: true
+      B: false
+      C: false
+      Bp: false
+
+  B:
+    trainable: true
+    switches:
+      A: false
+      B: true
+      C: false
+      Bp: false
+
+  AB:
+    trainable: true
+    switches:
+      A: true
+      B: true
+      C: false
+      Bp: false
+
+  C:
+    trainable: true
+    switches:
+      A: false
+      B: false
+      C: true
+      Bp: false
+
+  Bp:
+    trainable: true
+    switches:
+      A: false
+      B: false
+      C: false
+      Bp: true
+
+  # 11/28 승격 조건 충족 시 추가 실행 구성
+  AC:
+    trainable: true
+    promoted_only: true
+    switches:
+      A: true
+      B: false
+      C: true
+      Bp: false
+
+  BC:
+    trainable: true
+    promoted_only: true
+    switches:
+      A: false
+      B: true
+      C: true
+      Bp: false
+
+  ABC:
+    trainable: true
+    promoted_only: true
+    switches:
+      A: true
+      B: true
+      C: true
+      Bp: false

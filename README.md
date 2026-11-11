@@ -1,1 +1,47 @@
-# Initializing Setting 
+# VideoProcessing-Project — x4 초해상화 개선 실험 파이프라인
+
+> 상명대학교 영상처리 기말 프로젝트 (2인 팀).  
+> 강의 개념에 근거해 ESPCN 베이스라인(RGB 입력, L1 손실)의 약점을 진단하고, 개선의 기여를 동일 공정 비교 조건·Ablation·시드 3회 반복으로 입증합니다.
+
+## 문서 안내
+
+- [요구사항 명세서 (`docs/SPEC.md`)](docs/SPEC.md)
+- [도메인 용어집 (`docs/GLOSSARY.md`)](docs/GLOSSARY.md)
+- 아키텍처 결정 기록 (`docs/adr/`)
+  - [ADR-0001: 공정 비교 조건과 에폭 기반 학습 길이](docs/adr/0001-fair-comparison-conditions.md)
+  - [ADR-0002: 베이스라인 ESPCN (RGB 입력, L1 손실)](docs/adr/0002-baseline-espcn-rgb-l1.md)
+  - [ADR-0003: 평가 프로토콜 (BT.601 Y 기준 및 자기 베이스라인 대비 Δ)](docs/adr/0003-evaluation-protocol.md)
+  - [ADR-0004: 개선 범위 (핵심 A·B, 탐색 C, 통제 B′)](docs/adr/0004-improvement-scope-core-and-exploratory.md)
+  - [ADR-0005: 실행 환경(VS Code Colab T4) 및 결과 저장 규칙](docs/adr/0005-execution-environment-and-result-storage.md)
+
+## 저장소 구조
+
+```text
+.
+├── configs/                  # 공정 비교 조건(단일 진실 소스) 및 실험 구성 스위치 정의
+├── data/                     # 런타임 로컬 데이터 경로 안내 (실제 데이터는 Git 미추적)
+├── docs/                     # 요구사항 명세서, 용어집, ADR
+│   └── adr/
+├── notebooks/                # Colab T4 / Kaggle 얇은 실행 창구 노트북 (로직 미포함)
+├── results/
+│   ├── aggregated/           # main 병합 기록 기반 자동 집계 표·그림
+│   ├── pilot/                # 1주차 진단 및 파일럿 실행 결과 (본 결과 표 제외)
+│   └── runs/                 # 본 실행 기록 (summary, per_image, 대표 이미지)
+├── scripts/                  # CLI 실행 진입점
+├── src/sr_pipeline/          # 공용 규칙·데이터·모델·손실·평가·진단·집계·데모 모듈
+└── tests/                    # 로컬 CPU 단위·경계 테스트
+```
+
+## 작업 흐름
+
+1. 로컬에서 각자 이름 브랜치를 생성·체크아웃해 개발 및 로컬 CPU 테스트(`pytest`)를 실행합니다.
+2. `notebooks/`의 얇은 실행 노트북으로 Colab T4 런타임에서 브랜치를 가져와 학습·평가를 실행합니다.
+3. 실행 기록(`results/runs/`)은 실행자 브랜치에 커밋하고 PR 리뷰를 거쳐 `main`에 병합합니다.
+4. 보고서·발표의 모든 수치와 그림은 `main`에 병합된 실행 기록을 `scripts/aggregate_results.py`로 자동 생성한 산출물만 사용합니다.
+
+## 로컬 환경 확인
+
+```bash
+pip install -r requirements.txt
+pytest
+```

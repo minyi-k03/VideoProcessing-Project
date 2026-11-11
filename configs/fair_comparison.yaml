@@ -1,0 +1,45 @@
+# 공정 비교 조건 (단일 진실 소스, ADR-0001 / SPEC.md)
+# 구성 정의(configs/experiments.yaml)는 이 파일의 어떤 값도 덮어쓸 수 없습니다.
+# 파일럿 실행 후 1회 확정되면 본 실행 완료 전까지 변경하지 않습니다.
+
+fixed_rules:
+  scale: 4
+  degradation: bicubic
+  bicubic_rule: matlab_imresize_antialias
+  color_standard: bt601_matlab_rgb2ycbcr
+  eval_checkpoint: last_epoch
+  max_hours: 3.0
+  seeds: [0, 1, 2]
+  datasets: [Set5, Set14, BSD100, Urban100]
+  shave_border: 4
+  lpips_backbone: alex
+
+infer_benchmark:
+  lr_height: 180
+  lr_width: 320
+  sr_height: 720
+  sr_width: 1280
+  batch_size: 1
+  precision: fp32
+  warmup_runs: 10
+  repeat_runs: 100
+
+# 파일럿(11/18~19) 이후 첫 본 실행 전에 1회 고정할 값
+pilot_determined:
+  patch_pool_id: null        # 패치 풀 생성 시 확정 (예: div2k_x4_p48_nXXXX_s42)
+  patch_pool_size: null
+  patch_size_hr: null
+  patches_per_epoch: null
+  epochs: null
+  batch_size: null
+  learning_rate: null
+  optimizer: null
+  scheduler: null
+  augmentation: null
+  edge_loss_lambda: null     # +A 계열 공통 λ
+  edge_top_q: null           # 에지 PSNR 상위 비율 q (%)
+  representative_images:     # 파일럿 베이스라인 PSNR(Y) 중앙값 / 최하위 영상으로 고정
+    Set5: {median: null, worst: null}
+    Set14: {median: null, worst: null}
+    BSD100: {median: null, worst: null}
+    Urban100: {median: null, worst: null}

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments & Secrets (ADR-0005: 토큰/자격증명 커밋 금지)
+.venv/
+venv/
+env/
+.env
+.env.*
+*.token
+*secret*
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & Large Artifacts (Drive / Kaggle Dataset으로 관리)
+data/*
+!data/.gitkeep
+!data/README.md
+*.zip
+*.tar
+*.tar.gz
+
+# Checkpoints (기본 저장 위치: Drive. 불가피하게 커밋 시 예외적으로만 추적)
+checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
