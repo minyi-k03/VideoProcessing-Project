@@ -19,6 +19,10 @@ env/
 *.token
 *secret*
 
+# Personal agent settings (Harness §3 ④: 개인 설정은 커밋 금지)
+CLAUDE.local.md
+.claude/settings.local.json
+
 # Jupyter
 .ipynb_checkpoints/
 
