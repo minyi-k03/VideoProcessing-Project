@@ -21,11 +21,14 @@ def _restore_global_random_state() -> Iterator[None]:
     python_state = random.getstate()
     numpy_state = np.random.get_state()
     torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     cudnn_flags = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
     yield
     random.setstate(python_state)
     np.random.set_state(numpy_state)
     torch.set_rng_state(torch_state)
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
     torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = cudnn_flags
 
 
@@ -110,6 +113,27 @@ def test_non_integer_seed_is_rejected(function: Callable[[int], object], bad_see
 def test_numpy_integer_seed_is_accepted() -> None:
     """배열에서 꺼낸 numpy 정수 시드도 같은 값의 파이썬 정수와 같은 결과를 낸다."""
     np.testing.assert_array_equal(_draw(create_data_rng(np.int64(2))), _draw(create_data_rng(2)))
+
+
+def _python_and_numpy_global_draws(seed: int) -> tuple[float, float]:
+    set_model_seed(seed)
+    return random.random(), float(np.random.random())
+
+
+def test_model_seed_fixes_python_and_numpy_global_streams() -> None:
+    """같은 시드면 파이썬 random·numpy 전역 난수도 같고, 시드가 다르면 다르다."""
+    assert _python_and_numpy_global_draws(1) == _python_and_numpy_global_draws(1)
+    _assert_all_distinct([_python_and_numpy_global_draws(seed) for seed in (0, 1, 2)], lambda a, b: a[0] == b[0])
+    _assert_all_distinct([_python_and_numpy_global_draws(seed) for seed in (0, 1, 2)], lambda a, b: a[1] == b[1])
+
+
+def test_model_seed_puts_cudnn_in_deterministic_mode() -> None:
+    """cuDNN이 어떤 상태에서 시작하든 set_model_seed 뒤에는 결정적 모드(deterministic=True, benchmark=False)다."""
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    set_model_seed(0)
+    assert torch.backends.cudnn.deterministic is True
+    assert torch.backends.cudnn.benchmark is False
 
 
 def test_model_init_same_seed_gives_same_weights() -> None:
