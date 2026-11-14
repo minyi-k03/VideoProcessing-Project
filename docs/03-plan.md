@@ -18,7 +18,7 @@
 ### 현재 상태 (11/14 기준)
 
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, main 병합은 차가원 승인 대기).
-- `common/bicubic.py`도 구현되어 로컬 CPU 테스트를 통과한다(T1.2 진행: Gemini 교차 리뷰와 Colab CUDA·BasicSR 대조 확인 대기, 차가원 승인 전 main 병합 금지). 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
+- `common/bicubic.py`도 구현되어 로컬 CPU 테스트를 통과한다(T1.2 진행: Gemini 교차 리뷰 반영 완료, Colab CUDA 일치·실제 BasicSR 대조 확인 대기, 차가원 승인 전 main 병합 금지). 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
 - 스켈레톤 테스트 17개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
 - 이미 완료된 것:

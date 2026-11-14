@@ -198,12 +198,14 @@ def _resize_axis_reference(
         weights = _cubic_kernel_reference(distance)
     weights = weights / weights.sum(axis=1, keepdims=True)
 
-    pad_start = int(-indices.min() + 1)
-    pad_end = int(indices.max() - in_length)
+    # 첫 탭이 입력 0보다 오른쪽에서 시작하면(극단 축소) 앞쪽 패딩은 필요 없다. 패딩 길이와
+    # 인덱스 오프셋이 같은 값을 쓰도록 0으로 자른다.
+    pad_start = max(int(-indices.min() + 1), 0)
+    pad_end = max(int(indices.max() - in_length), 0)
     moved = np.moveaxis(data, axis, 0)
     padded = np.pad(
         moved,
-        [(max(pad_start, 0), max(pad_end, 0))] + [(0, 0)] * (moved.ndim - 1),
+        [(pad_start, pad_end)] + [(0, 0)] * (moved.ndim - 1),
         mode="symmetric",
     )
     positions = (indices + pad_start - 1).astype(np.int64)  # 패딩된 배열 기준 0-indexed
@@ -242,6 +244,7 @@ def fresh_bicubic_cache():
         (1, 1, 4.0, True),  # 커널 지지 범위(4화소)보다 작은 입력: 대칭 반사가 여러 번 접힌다
         (2, 3, 4.0, True),
         (3, 5, 0.25, True),
+        (40, 40, 0.1, False),  # 안티에일리어싱 없이 극단 축소: 첫 탭이 입력 0보다 오른쪽에서 시작한다
     ],
 )
 @pytest.mark.parametrize(("dtype", "atol"), [(torch.float64, 1e-9), (torch.float32, 1e-5)])
