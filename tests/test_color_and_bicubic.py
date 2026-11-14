@@ -16,7 +16,11 @@ from sr_pipeline.common.color import (
 
 
 def _matlab_rgb2ycbcr_reference(rgb: np.ndarray) -> np.ndarray:
-    """MATLAB rgb2ycbcr(double, [0, 1])의 정의를 numpy로 직접 옮긴 참조 구현. rgb: (H, W, 3)."""
+    """BasicSR/MATLAB rgb2ycbcr(uint8 스케일)의 정의를 numpy로 직접 옮긴 참조 구현. rgb: (H, W, 3).
+
+    구현과 같은 계수를 다시 적은 것이라 계수 오타는 못 잡는다. 계수 자체는 아래
+    test_bt601_primary_colors_known_values의 널리 알려진 고정 값이 독립적으로 지킨다.
+    """
     r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     y = 16.0 + 65.481 * r + 128.553 * g + 24.966 * b
     cb = 128.0 - 37.797 * r - 74.203 * g + 112.0 * b
@@ -39,6 +43,26 @@ def test_bt601_y_matches_matlab_reference() -> None:
 
     np.testing.assert_allclose(ycbcr, expected, atol=1e-9)
     np.testing.assert_allclose(y_only, expected[..., 0], atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("rgb", "expected_ycbcr"),
+    [
+        ((1.0, 0.0, 0.0), (81.481, 90.203, 240.0)),
+        ((0.0, 1.0, 0.0), (144.553, 53.797, 34.214)),
+        ((0.0, 0.0, 1.0), (40.966, 240.0, 109.786)),
+        ((1.0, 1.0, 1.0), (235.0, 128.0, 128.0)),
+        ((0.0, 0.0, 0.0), (16.0, 128.0, 128.0)),
+    ],
+)
+def test_bt601_primary_colors_known_values(rgb, expected_ycbcr) -> None:
+    """원색·흑백의 BT.601 값(적색 81.481/90.203/240 등)이 알려진 고정 값과 일치해야 합니다.
+
+    구현 계수를 다시 쓰지 않은 값이라, 계수 오타가 참조 구현과 같이 틀려도 여기서 잡힌다.
+    """
+    pixel = torch.tensor(rgb, dtype=torch.float64).view(1, 3, 1, 1)
+    actual = rgb_to_ycbcr(pixel).flatten().tolist()
+    assert actual == pytest.approx(expected_ycbcr, abs=1e-3)
 
 
 def test_bt601_range_endpoints() -> None:
