@@ -40,11 +40,17 @@ def _constants(
 
     역행렬은 float64로 구한 뒤 dtype으로 내립니다. 호출마다 텐서를 새로 만들지 않아
     ADR-0003의 추론 시간(전체) 측정에 색 변환의 상수 생성 비용이 들어가지 않습니다.
+
+    이 함수가 평가·추론 시간 측정의 `torch.inference_mode()` 안에서 처음 불리면, 보통의
+    텐서로 만들지 않을 경우 inference 텐서가 캐시에 남아 이후 학습(B·B′)의 역전파가
+    "Inference tensors cannot be saved for backward"로 실패한다. 그래서 항상
+    inference_mode를 끄고 일반 텐서로 만든다.
     """
-    forward64 = torch.tensor(_RGB_TO_YCBCR_MATRIX, dtype=torch.float64)
-    forward = forward64.to(device=device, dtype=dtype)
-    inverse = torch.linalg.inv(forward64).to(device=device, dtype=dtype)
-    offset = torch.tensor(_YCBCR_OFFSET, device=device, dtype=dtype).view(1, 3, 1, 1)
+    with torch.inference_mode(False):
+        forward64 = torch.tensor(_RGB_TO_YCBCR_MATRIX, dtype=torch.float64)
+        forward = forward64.to(device=device, dtype=dtype)
+        inverse = torch.linalg.inv(forward64).to(device=device, dtype=dtype)
+        offset = torch.tensor(_YCBCR_OFFSET, device=device, dtype=dtype).view(1, 3, 1, 1)
     return forward, inverse, offset
 
 

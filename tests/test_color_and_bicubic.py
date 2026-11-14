@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+import sr_pipeline.common.color as color_module
 from sr_pipeline.common.color import (
     denormalize_y,
     normalize_y,
@@ -33,16 +34,24 @@ def _random_rgb(seed: int = 0) -> torch.Tensor:
     return torch.rand(2, 3, 8, 9, generator=generator, dtype=torch.float64)
 
 
+@pytest.fixture
+def fresh_color_cache():
+    """상수 캐시 상태가 테스트끼리 새지 않게 앞뒤로 비운다."""
+    color_module._constants.cache_clear()
+    yield
+    color_module._constants.cache_clear()
+
+
 def test_bt601_y_matches_matlab_reference() -> None:
-    """BT.601 Y 변환이 MATLAB/BasicSR 참조 구현과 허용 오차 안에서 일치해야 합니다."""
+    """BT.601 Y 변환이 MATLAB/BasicSR 참조 구현과 허용 오차 안에서 일치해야 합니다(배치 전체)."""
     rgb = _random_rgb()
-    expected = _matlab_rgb2ycbcr_reference(rgb[0].permute(1, 2, 0).numpy())
+    ycbcr = rgb_to_ycbcr(rgb)
+    y_only = rgb_to_y(rgb)
 
-    ycbcr = rgb_to_ycbcr(rgb)[0].permute(1, 2, 0).numpy()
-    y_only = rgb_to_y(rgb)[0, 0].numpy()
-
-    np.testing.assert_allclose(ycbcr, expected, atol=1e-9)
-    np.testing.assert_allclose(y_only, expected[..., 0], atol=1e-9)
+    for index in range(rgb.shape[0]):
+        expected = _matlab_rgb2ycbcr_reference(rgb[index].permute(1, 2, 0).numpy())
+        np.testing.assert_allclose(ycbcr[index].permute(1, 2, 0).numpy(), expected, atol=1e-9)
+        np.testing.assert_allclose(y_only[index, 0].numpy(), expected[..., 0], atol=1e-9)
 
 
 @pytest.mark.parametrize(
@@ -59,10 +68,11 @@ def test_bt601_primary_colors_known_values(rgb, expected_ycbcr) -> None:
     """원색·흑백의 BT.601 값(적색 81.481/90.203/240 등)이 알려진 고정 값과 일치해야 합니다.
 
     구현 계수를 다시 쓰지 않은 값이라, 계수 오타가 참조 구현과 같이 틀려도 여기서 잡힌다.
+    rgb_to_y도 같은 값(Y)을 내야 한다.
     """
     pixel = torch.tensor(rgb, dtype=torch.float64).view(1, 3, 1, 1)
-    actual = rgb_to_ycbcr(pixel).flatten().tolist()
-    assert actual == pytest.approx(expected_ycbcr, abs=1e-3)
+    assert rgb_to_ycbcr(pixel).flatten().tolist() == pytest.approx(expected_ycbcr, abs=1e-3)
+    assert rgb_to_y(pixel).item() == pytest.approx(expected_ycbcr[0], abs=1e-3)
 
 
 def test_bt601_range_endpoints() -> None:
@@ -97,19 +107,59 @@ def test_normalize_y_round_trip_and_range() -> None:
     assert torch.allclose(denormalize_y(normalized), y)
 
 
+def test_normalize_y_does_not_clip_out_of_range_values() -> None:
+    """자르기 전 출력(Y가 16~235 밖)도 정규화가 자르지 않고 [0, 1] 밖 값으로 보존해야 합니다."""
+    y = torch.tensor([0.0, 300.0]).view(1, 1, 1, 2)
+    normalized = normalize_y(y)
+    assert normalized[..., 0] < 0.0 and normalized[..., 1] > 1.0
+    assert torch.allclose(denormalize_y(normalized), y, atol=1e-4)  # float32 반올림 오차 허용
+
+
 def test_color_functions_reject_wrong_channels() -> None:
     """3채널이 아닌 입력은 조용히 넘어가지 않고 오류여야 합니다."""
     with pytest.raises(ValueError):
         rgb_to_ycbcr(torch.zeros(1, 1, 4, 4))
     with pytest.raises(ValueError):
+        rgb_to_y(torch.zeros(1, 1, 4, 4))
+    with pytest.raises(ValueError):
         ycbcr_to_rgb(torch.zeros(3, 4, 4))
 
 
-def test_color_runs_on_float32_cpu() -> None:
-    """학습·평가에서 쓰는 float32 입력에서도 dtype이 유지되어야 합니다."""
+def test_color_float32_keeps_dtype_and_accuracy() -> None:
+    """본 실행 정밀도(FP32)에서 모든 함수가 dtype을 유지하고 왕복 오차가 작아야 합니다."""
     rgb = _random_rgb(2).float()
     assert rgb_to_ycbcr(rgb).dtype == torch.float32
-    assert ycbcr_to_rgb(rgb_to_ycbcr(rgb)).dtype == torch.float32
+    assert rgb_to_y(rgb).dtype == torch.float32
+    assert normalize_y(rgb_to_y(rgb)).dtype == torch.float32
+    assert denormalize_y(normalize_y(rgb_to_y(rgb))).dtype == torch.float32
+    restored = ycbcr_to_rgb(rgb_to_ycbcr(rgb))
+    assert restored.dtype == torch.float32
+    assert torch.allclose(restored, rgb, atol=1e-4)
+
+
+def test_color_gradients_flow_with_expected_values(fresh_color_cache) -> None:
+    """B·B′는 손실 그래프 안에서 이 함수들을 부르므로 역전파가 되어야 하고 기울기가 계수와 같아야 합니다."""
+    rgb = torch.rand(1, 3, 4, 4, dtype=torch.float64, requires_grad=True)
+    rgb_to_y(rgb).sum().backward()
+    expected = torch.tensor([65.481, 128.553, 24.966], dtype=torch.float64).view(1, 3, 1, 1)
+    assert torch.allclose(rgb.grad, expected.expand_as(rgb))
+
+    ycbcr = torch.rand(1, 3, 4, 4, requires_grad=True)
+    ycbcr_to_rgb(ycbcr).sum().backward()
+    assert ycbcr.grad is not None and torch.isfinite(ycbcr.grad).all()
+
+
+def test_backward_works_after_constants_first_built_in_inference_mode(fresh_color_cache) -> None:
+    """평가·추론 시간 측정이 inference_mode로 먼저 돌아도, 이후 학습 역전파가 깨지면 안 됩니다."""
+    with torch.inference_mode():
+        sample = torch.rand(1, 3, 4, 4)
+        rgb_to_ycbcr(sample)
+        rgb_to_y(sample)
+        ycbcr_to_rgb(sample)
+
+    rgb = torch.rand(1, 3, 4, 4, requires_grad=True)
+    (rgb_to_ycbcr(rgb).sum() + rgb_to_y(rgb).sum() + ycbcr_to_rgb(rgb).sum()).backward()
+    assert rgb.grad is not None and torch.isfinite(rgb.grad).all()
 
 
 @pytest.mark.skip(reason="Skeleton test: implement alongside common.bicubic")

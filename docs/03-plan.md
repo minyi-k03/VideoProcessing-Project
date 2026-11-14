@@ -15,10 +15,10 @@
 - **⚠ 표시:** 공정 비교 조건·손실·데이터·평가·색/보간 규칙을 바꾸는 Task. PR에 그 사실을 적고 상대 팀원의 승인을 받는다(US69).
 - **US:** SPEC 사용자 스토리 번호
 
-### 현재 상태 (11/11 기준)
+### 현재 상태 (11/14 기준)
 
-- `src/sr_pipeline/` 전 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
-- 테스트 19개가 모두 `@pytest.mark.skip`이다.
+- `common/color.py`는 구현되어 테스트를 통과한다(T1.1, 교차 리뷰 반영 중). 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
+- 스켈레톤 테스트 18개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
 - 이미 완료된 것:
   - `configs/experiments.yaml`(10개 구성)
