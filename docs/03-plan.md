@@ -20,7 +20,7 @@
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, main 병합은 차가원 승인 대기).
 - `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, main 병합은 차가원 승인 대기).
 - `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, main 병합은 차가원 승인 대기). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
-- `data/prepare.py`(패치 풀·테스트셋 LR 생성·압축)와 `scripts/prepare_data.py`는 구현되어 합성 데이터 테스트와 CLI 실행을 로컬에서 통과한다(T1.4 진행). 실제 DIV2K 800장·테스트셋 4종 실행 확인은 Colab에서 남았다. 패치 크기·개수는 필수 인자이며 값은 `fair_comparison.yaml`에 없다(T4.2에서 확정). 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
+- `data/prepare.py`(패치 풀·테스트셋 LR 생성·압축)와 `scripts/prepare_data.py`는 구현되어 합성 데이터 테스트와 CLI 실행을 로컬에서 통과한다(T1.4 진행). Gemini 교차 리뷰(클램핑 검증, 실패 시 반쪽 산출물, 입력 검증, OS별 파일 정렬)를 반영했다. 실제 DIV2K 800장·테스트셋 4종 실행 확인은 Colab에서 남았다. 패치 크기·개수는 필수 인자이며 값은 `fair_comparison.yaml`에 없다(T4.2에서 확정). 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
 - 스켈레톤 테스트 17개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
 - 이미 완료된 것:
