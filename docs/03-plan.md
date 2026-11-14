@@ -36,7 +36,7 @@
 
 | 역할 | 담당 |
 | --- | --- |
-| 공통 기반 담당 (`configs/`, `common/`, `evaluation/`, 의존성, `AGENTS.md`) | 팀 결정 |
+| 공통 기반 담당 (`configs/`, `common/`, `evaluation/`, 의존성, `AGENTS.md`) | 고용민 |
 | 병합 담당 (main이 항상 `pytest` 통과 상태 유지) | 팀 결정 |
 
 ## 3. 마일스톤
