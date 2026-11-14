@@ -15,12 +15,13 @@
 - **⚠ 표시:** 공정 비교 조건·손실·데이터·평가·색/보간 규칙을 바꾸는 Task. PR에 그 사실을 적고 상대 팀원의 승인을 받는다(US69).
 - **US:** SPEC 사용자 스토리 번호
 
-### 현재 상태 (11/14 기준)
+### 현재 상태 (11/15 기준)
 
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, main 병합은 차가원 승인 대기).
 - `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, main 병합은 차가원 승인 대기).
 - `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, main 병합은 차가원 승인 대기). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
 - `data/prepare.py`(패치 풀·테스트셋 LR 생성·압축)와 `scripts/prepare_data.py`는 구현되어 합성 데이터 테스트와 Colab 실제 데이터 확인을 통과한다(T1.4 통과, main 병합은 차가원 승인 대기). Gemini 교차 리뷰(클램핑 검증, 실패 시 반쪽 산출물, 입력 검증, OS별 파일 정렬)를 반영했다. Colab에서 DIV2K 800장과 테스트셋 4종(5·14·100·100장)으로 파일럿용 풀(패치 96, 10000개, 시드 42; `patch_pool_id` `div2k_x4_p96_n10000_s42_e8bc539e`, 압축 파일 387MB, 373초)을 만들고, 압축 해제 후 `content_sha256` 재계산과 테스트셋 HR/LR 대응을 확인했다. 시드 고정 합성 영상의 `patch_pool_id`는 Windows와 Colab(Linux)에서 같다. 패치 크기·개수는 필수 인자이며 값은 `fair_comparison.yaml`에 없다. 본 실행 풀은 T4.2에서 확정한 값으로 다시 만든다. 테스트셋은 HR을 4의 배수로 잘라(modcrop, 104장이 잘림) 저장하므로 평가(T2.4)는 저장된 HR만 써야 한다. 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
+- 위 압축 파일(파일럿용 풀 `div2k_x4_p96_n10000_s42_e8bc539e`, 387MB)을 공유 Drive와 Kaggle 비공개 Dataset에 올리고 두 경로에서 내려받아 확인했다(T1.5 통과, `notebooks/t1_5_upload_check.ipynb`). Drive: 로그인 없이 공유 링크(`gdown`)로 받은 zip의 sha256이 원본(`77e4a08f77a9c651cfea613204c5bbc8a6031c63bf2df07b20941a3c5e4e87b8`)과 같고, 해제 후 `content_sha256` 재계산·`patch_pool_id`·테스트셋 4종 HR/LR 대응이 모두 통과했다(Colab). Kaggle: Kaggle이 zip을 자동 해제해 원본 zip 해시는 비교하지 못했고, 해제본의 `content_sha256` 재계산과 `patch_pool_id` 일치로 확인했다(Kaggle 노트북, CPU). 저장소가 Public이라 공유 링크와 Dataset 주소는 기록하지 않는다(팀원에게 따로 전달). 본 실행 풀은 T4.2에서 값을 고정한 뒤 같은 방식으로 다시 올려야 한다.
 - 스켈레톤 테스트 17개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
 - 이미 완료된 것:
@@ -94,7 +95,7 @@ x4 SR 개선 실험
 | T1.2 ⚠ | `common/bicubic.py`: 화소 중심 정렬, 축소 시 안티에일리어싱, GPU 텐서 연산 | 고용민 | — | 11–12 | BasicSR MATLAB 호환 `imresize`와 허용 오차 내 일치 테스트 통과 | 통과 |
 | T1.3 | `common/seed.py`: 시드 하나 → 모델 초기화 난수 + 데이터 난수 | 고용민 | — | 32 | 같은 시드 재현 테스트 통과 | 통과 |
 | T1.4 ⚠ | `data/prepare.py`: DIV2K HR 800장 → LR, 패치 풀 1회 생성 + 생성 조건·식별자 기록. 테스트셋 4종 LR 생성. 압축 파일 1개 | 고용민 | T1.2 | 4, 8, 9 | 압축 파일과 메타데이터(`patch_pool_id`) 생성 | 통과 |
-| T1.5 | 압축 파일을 공유 Drive와 Kaggle 비공개 Dataset에 업로드, 공유 링크 확보 | 고용민 | T1.4 | 5–6 | 두 경로에서 내려받아 해제 확인 | 진행 |
+| T1.5 | 압축 파일을 공유 Drive와 Kaggle 비공개 Dataset에 업로드, 공유 링크 확보 | 고용민 | T1.4 | 5–6 | 두 경로에서 내려받아 해제 확인 | 통과 |
 
 ### M2 최소 진단 (~11/14, 최우선)
 
