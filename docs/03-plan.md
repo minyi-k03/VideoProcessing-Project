@@ -87,7 +87,7 @@ x4 SR 개선 실험
 
 | ID | 작업 | 담당 | 선행 | US | 완료 조건 | 상태 |
 | --- | --- | --- | --- | --- | --- | --- |
-| T1.1 ⚠ | `common/color.py`: BT.601(MATLAB `rgb2ycbcr` 계수) RGB↔YCbCr, Y 16~235 정규화 | 고용민 | — | 10 | `test_color_and_bicubic.py` 색 변환 항목 통과 | 대기 |
+| T1.1 ⚠ | `common/color.py`: BT.601(MATLAB `rgb2ycbcr` 계수) RGB↔YCbCr, Y 16~235 정규화 | 고용민 | — | 10 | `test_color_and_bicubic.py` 색 변환 항목 통과 | 진행 |
 | T1.2 ⚠ | `common/bicubic.py`: 화소 중심 정렬, 축소 시 안티에일리어싱, GPU 텐서 연산 | 고용민 | — | 11–12 | BasicSR MATLAB 호환 `imresize`와 허용 오차 내 일치 테스트 통과 | 대기 |
 | T1.3 | `common/seed.py`: 시드 하나 → 모델 초기화 난수 + 데이터 난수 | 고용민 | — | 32 | 같은 시드 재현 테스트 통과 | 대기 |
 | T1.4 | `data/prepare.py`: DIV2K HR 800장 → LR, 패치 풀 1회 생성 + 생성 조건·식별자 기록. 테스트셋 4종 LR 생성. 압축 파일 1개 | 고용민 | T1.2 | 4, 8, 9 | 압축 파일과 메타데이터(`patch_pool_id`) 생성 | 대기 |
