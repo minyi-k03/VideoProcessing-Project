@@ -19,7 +19,7 @@
 
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, main 병합은 차가원 승인 대기).
 - `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, main 병합은 차가원 승인 대기).
-- `common/seed.py`도 구현되어 로컬 CPU 테스트를 통과한다. T1.3은 Colab T4에서 CUDA 시드 확인을 마치면 통과로 바꾼다(T1.3 진행). 학습 루프의 GPU 결정성은 T3.7에서 본다. 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
+- `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, main 병합은 차가원 승인 대기). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다. 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
 - 스켈레톤 테스트 17개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
 - 이미 완료된 것:
@@ -91,7 +91,7 @@ x4 SR 개선 실험
 | --- | --- | --- | --- | --- | --- | --- |
 | T1.1 ⚠ | `common/color.py`: BT.601(MATLAB `rgb2ycbcr` 계수) RGB↔YCbCr, Y 16~235 정규화 | 고용민 | — | 10 | `test_color_and_bicubic.py` 색 변환 항목 통과 | 통과 |
 | T1.2 ⚠ | `common/bicubic.py`: 화소 중심 정렬, 축소 시 안티에일리어싱, GPU 텐서 연산 | 고용민 | — | 11–12 | BasicSR MATLAB 호환 `imresize`와 허용 오차 내 일치 테스트 통과 | 통과 |
-| T1.3 | `common/seed.py`: 시드 하나 → 모델 초기화 난수 + 데이터 난수 | 고용민 | — | 32 | 같은 시드 재현 테스트 통과 | 진행 |
+| T1.3 | `common/seed.py`: 시드 하나 → 모델 초기화 난수 + 데이터 난수 | 고용민 | — | 32 | 같은 시드 재현 테스트 통과 | 통과 |
 | T1.4 | `data/prepare.py`: DIV2K HR 800장 → LR, 패치 풀 1회 생성 + 생성 조건·식별자 기록. 테스트셋 4종 LR 생성. 압축 파일 1개 | 고용민 | T1.2 | 4, 8, 9 | 압축 파일과 메타데이터(`patch_pool_id`) 생성 | 대기 |
 | T1.5 | 압축 파일을 공유 Drive와 Kaggle 비공개 Dataset에 업로드, 공유 링크 확보 | 고용민 | T1.4 | 5–6 | 두 경로에서 내려받아 해제 확인 | 대기 |
 
