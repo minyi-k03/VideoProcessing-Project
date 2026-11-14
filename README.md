@@ -15,6 +15,7 @@
   - [ADR-0004: 개선 범위 (핵심 A·B, 탐색 C, 통제 B′)](docs/adr/0004-improvement-scope-core-and-exploratory.md)
   - [ADR-0005: 실행 환경(VS Code Colab T4) 및 결과 저장 규칙](docs/adr/0005-execution-environment-and-result-storage.md)
   - [ADR-0006: 보고서·발표의 모든 수치는 실행 기록에서 스크립트로 생성](docs/adr/0006-report-numbers-from-logs-only.md)
+  - [ADR-0007: Skills 원본은 `.agents/skills/` 하나, `.claude/skills/`는 동기화 사본](docs/adr/0007-skills-single-source-with-claude-copy.md)
 
 ## 저장소 구조
 
