@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import itertools
+import random
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any
+
 import numpy as np
 import pytest
 import torch
@@ -10,8 +15,28 @@ from torch import nn
 from sr_pipeline.common.seed import create_data_rng, set_model_seed
 
 
+@pytest.fixture(autouse=True)
+def _restore_global_random_state() -> Iterator[None]:
+    """set_model_seed가 바꾸는 프로세스 전역 상태를 테스트마다 되돌려 다른 테스트에 새지 않게 한다."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cudnn_flags = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+    yield
+    random.setstate(python_state)
+    np.random.set_state(numpy_state)
+    torch.set_rng_state(torch_state)
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = cudnn_flags
+
+
 def _draw(rng: np.random.Generator) -> np.ndarray:
+    """데이터 난수에서 정수 16개를 뽑는다. 16개면 서로 다른 시드의 수열이 우연히 같을 일이 없다."""
     return rng.integers(0, 2**31 - 1, size=16)
+
+
+def _assert_all_distinct(items: Sequence[Any], equal: Callable[[Any, Any], bool]) -> None:
+    for (i, a), (j, b) in itertools.combinations(enumerate(items), 2):
+        assert not equal(a, b), f"항목 {i}와 {j}가 같다"
 
 
 def _init_weights(seed: int) -> torch.Tensor:
@@ -28,9 +53,7 @@ def test_data_rng_same_seed_gives_same_sequence() -> None:
 def test_data_rng_different_seeds_give_different_sequences() -> None:
     """시드 0·1·2의 데이터 난수 수열은 서로 모두 다르다."""
     draws = [_draw(create_data_rng(seed)) for seed in (0, 1, 2)]
-    for i in range(3):
-        for j in range(i + 1, 3):
-            assert not np.array_equal(draws[i], draws[j])
+    _assert_all_distinct(draws, np.array_equal)
 
 
 def test_data_sequence_is_independent_of_model_side_randomness() -> None:
@@ -69,12 +92,24 @@ def test_each_data_rng_call_returns_independent_generator() -> None:
     np.testing.assert_array_equal(_draw(second), _draw(create_data_rng(1)))
 
 
-def test_negative_seed_is_rejected() -> None:
-    """시드는 0 이상 정수여야 한다. 음수가 조용히 다른 시드로 처리되면 안 된다."""
+@pytest.mark.parametrize("function", [create_data_rng, set_model_seed])
+def test_negative_seed_is_rejected(function: Callable[[int], object]) -> None:
+    """시드는 0 이상이어야 한다. 음수가 조용히 다른 시드로 처리되면 안 된다."""
     with pytest.raises(ValueError):
-        create_data_rng(-1)
-    with pytest.raises(ValueError):
-        set_model_seed(-1)
+        function(-1)
+
+
+@pytest.mark.parametrize("function", [create_data_rng, set_model_seed])
+@pytest.mark.parametrize("bad_seed", [1.5, "1", None, True])
+def test_non_integer_seed_is_rejected(function: Callable[[int], object], bad_seed: object) -> None:
+    """정수가 아닌 시드(실수·문자열·None·bool)는 거부한다."""
+    with pytest.raises(TypeError):
+        function(bad_seed)  # type: ignore[arg-type]
+
+
+def test_numpy_integer_seed_is_accepted() -> None:
+    """배열에서 꺼낸 numpy 정수 시드도 같은 값의 파이썬 정수와 같은 결과를 낸다."""
+    np.testing.assert_array_equal(_draw(create_data_rng(np.int64(2))), _draw(create_data_rng(2)))
 
 
 def test_model_init_same_seed_gives_same_weights() -> None:
@@ -85,6 +120,4 @@ def test_model_init_same_seed_gives_same_weights() -> None:
 def test_model_init_different_seeds_give_different_weights() -> None:
     """시드가 다르면 가중치 초기값이 다르다."""
     weights = [_init_weights(seed) for seed in (0, 1, 2)]
-    for i in range(3):
-        for j in range(i + 1, 3):
-            assert not torch.equal(weights[i], weights[j])
+    _assert_all_distinct(weights, torch.equal)
