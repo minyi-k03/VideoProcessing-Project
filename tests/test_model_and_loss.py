@@ -7,10 +7,7 @@ from __future__ import annotations
 
 import itertools
 import math
-import random
-from collections.abc import Iterator
 
-import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -23,18 +20,7 @@ from sr_pipeline.losses.sr_loss import SRLoss
 from sr_pipeline.models.espcn import ESPCN
 
 
-@pytest.fixture(autouse=True)
-def _restore_global_random_state() -> Iterator[None]:
-    """set_model_seed가 바꾸는 프로세스 전역 상태를 테스트마다 되돌린다(test_seed.py와 같은 방식)."""
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
-    torch_state = torch.get_rng_state()
-    cudnn_flags = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
-    yield
-    random.setstate(python_state)
-    np.random.set_state(numpy_state)
-    torch.set_rng_state(torch_state)
-    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = cudnn_flags
+pytestmark = pytest.mark.usefixtures("restore_global_random_state")
 
 
 def _rgb(batch: int = 2, height: int = 6, width: int = 7, seed: int = 0) -> torch.Tensor:
@@ -76,7 +62,7 @@ def test_switch_a_penalizes_blurred_edges() -> None:
     base = SRLoss()({"sr_rgb": blurred}, hr)
     with_edge = SRLoss(use_edge_loss=True, edge_loss_lambda=0.1)({"sr_rgb": blurred}, hr)
     assert with_edge > base
-    # 밝기만 다르고 에지가 같으면 에지 항은 0이다.
+    # 균일한 오프셋만 다르고 에지가 같으면 에지 항은 0이다.
     shifted = hr + 0.05
     assert SRLoss(use_edge_loss=True, edge_loss_lambda=1.0)({"sr_rgb": shifted}, hr).item() == pytest.approx(0.05)
 
@@ -128,6 +114,20 @@ def test_switch_b_keeps_gray_input_gray() -> None:
     assert torch.allclose(sr[:, 0], sr[:, 1], atol=1e-4) and torch.allclose(sr[:, 1], sr[:, 2], atol=1e-4)
 
 
+def test_switch_b_output_requires_y_loss() -> None:
+    """B 모델의 결과에 RGB 손실을 붙이면(배선 실수) 학습 전에 실패한다."""
+    lr, hr = _rgb(), _rgb(height=24, width=28, seed=1)
+    with pytest.raises(ValueError):
+        SRLoss()(ESPCN(use_y_channel=True).forward_raw(lr), hr)
+
+
+def test_switch_b_rejects_non_float_y() -> None:
+    hr = _rgb(height=8, width=8)
+    outputs = {"sr_rgb": hr.clone(), "sr_y_norm": torch.zeros(2, 1, 8, 8, dtype=torch.uint8)}
+    with pytest.raises(ValueError):
+        SRLoss(use_y_loss=True)(outputs, hr)
+
+
 def test_switch_b_loss_uses_model_y() -> None:
     """B 손실은 모델의 sr_y_norm으로 계산한다(학습 채널 = 손실 채널)."""
     hr = _rgb(height=8, width=8)
@@ -150,10 +150,10 @@ def test_switch_c_zero_residual_equals_bicubic_and_allows_negative() -> None:
     set_model_seed(0)
     baseline = ESPCN()
     set_model_seed(0)
-    residual = ESPCN(use_global_residual=True)
+    residual_model = ESPCN(use_global_residual=True)
     with torch.no_grad():
         prediction = baseline(lr)
-        difference = residual(lr) - bicubic_resize(lr, 4.0)
+        difference = residual_model(lr) - bicubic_resize(lr, 4.0)
     assert (prediction < 0).any()
     assert torch.allclose(difference, prediction, atol=1e-6)
 
@@ -185,8 +185,8 @@ def test_switch_bp_matches_baseline_params_and_io_with_y_loss() -> None:
     assert SRLoss(use_y_loss=True)(chroma_only, hr).item() == pytest.approx(0.0, abs=1e-6)
     assert SRLoss()(chroma_only, hr).item() > 0.01
 
-    luma = {"sr_rgb": hr + 0.1}
-    assert SRLoss(use_y_loss=True)(luma, hr).item() == pytest.approx(0.1, abs=1e-5)
+    shifted_rgb = {"sr_rgb": hr + 0.1}
+    assert SRLoss(use_y_loss=True)(shifted_rgb, hr).item() == pytest.approx(0.1, abs=1e-5)
 
 
 # ---------------------------------------------------------------- 모든 조합

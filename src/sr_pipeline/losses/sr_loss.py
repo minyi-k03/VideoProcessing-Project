@@ -42,7 +42,7 @@ class SobelEdgeLoss(nn.Module):
         """(B, C, H, W) → (B, C, 2, H, W): 채널별 수평·수직 Sobel 성분."""
         batch, channels, height, width = image.shape
         padded = F.pad(image.reshape(batch * channels, 1, height, width), (1, 1, 1, 1), mode="replicate")
-        grads = F.conv2d(padded, self.kernels.to(dtype=image.dtype))
+        grads = F.conv2d(padded, self.kernels.to(device=image.device, dtype=image.dtype))
         return grads.view(batch, channels, 2, height, width)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -87,12 +87,17 @@ class SRLoss(nn.Module):
         if sr_rgb.shape != hr_rgb.shape:
             raise ValueError(f"SR 결과와 HR 영상의 shape가 다릅니다: {tuple(sr_rgb.shape)} vs {tuple(hr_rgb.shape)}")
 
+        if "sr_y_norm" in sr_outputs and not self.use_y_loss:
+            # B 모델(Y 채널 처리)에 RGB 손실을 붙인 배선 실수. B는 반드시 use_y_loss=True로 만든다.
+            raise ValueError("sr_y_norm이 있는 SR 결과(스위치 B)에는 use_y_loss=True인 손실을 써야 합니다.")
         if self.use_y_loss:
             target = normalize_y(rgb_to_y(hr_rgb))
             if "sr_y_norm" in sr_outputs:  # B: 모델이 복원한 정규화된 Y
                 pred = sr_outputs["sr_y_norm"]
                 if pred.shape != target.shape:
                     raise ValueError(f"sr_y_norm은 {tuple(target.shape)}이어야 합니다: {tuple(pred.shape)}")
+                if not pred.is_floating_point():
+                    raise ValueError(f"sr_y_norm은 float 텐서여야 합니다: {pred.dtype}")
             else:  # B′: RGB SR 결과를 정규화된 Y로 바꾼다
                 pred = normalize_y(rgb_to_y(sr_rgb))
         else:
