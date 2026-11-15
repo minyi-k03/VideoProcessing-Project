@@ -76,7 +76,7 @@ def test_border_4px_difference_does_not_affect_metrics() -> None:
     assert compute_psnr(y_dirty, y_hr) == psnr_clean
     assert compute_ssim_y(y_dirty, y_hr) == ssim_clean
 
-    # 내부까지 동일한 경우 가장자리 4화소 차이가 있어도 PSNR=inf, SSIM=1이어야 한다.
+    # 내부까지 동일한 경우 가장자리 4화소 차이가 있어도 PSNR(Y)=inf, SSIM(Y)=1이어야 한다.
     sr_border_only = hr.clone()
     sr_border_only[:, :, :4, :] = 0.0
     y_border_only = postprocess_to_y(sr_border_only, border=4)
@@ -183,7 +183,7 @@ def test_compute_psnr_rejects_invalid_inputs(
 
 
 def test_compute_ssim_y_matches_analytical_constant_pair() -> None:
-    """상수 영상 쌍에서는 가우시안 창과 무관하게 SSIM = (2μ₁μ₂ + C₁) / (μ₁² + μ₂² + C₁)이다."""
+    """상수 영상 쌍에서는 가우시안 창과 무관하게 SSIM(Y) = (2μ₁μ₂ + C₁) / (μ₁² + μ₂² + C₁)이다."""
     y1 = torch.full((1, 1, 16, 16), 100.0, dtype=torch.float32)
     y2 = torch.full((1, 1, 16, 16), 110.0, dtype=torch.float32)
     c1 = (0.01 * 255.0) ** 2
