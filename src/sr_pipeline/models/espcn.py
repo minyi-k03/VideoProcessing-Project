@@ -22,6 +22,7 @@ import math
 import torch
 import torch.nn as nn
 
+SCALE = 4
 HIDDEN_CHANNELS = (64, 32)
 KERNEL_SIZES = (5, 3, 3)
 LAST_LAYER_INIT_STD = 1e-3
@@ -37,14 +38,13 @@ class ESPCN(nn.Module):
         use_global_residual: bool = False,
     ) -> None:
         super().__init__()
-        if scale < 1:
-            raise ValueError(f"scale은 1 이상이어야 합니다: {scale}")
+        if scale != SCALE:
+            raise ValueError(f"이 프로젝트의 배율은 x{SCALE} 고정입니다: {scale}")
         self.scale = scale
         self.use_y_channel = use_y_channel
         self.use_global_residual = use_global_residual
 
         channels = 1 if use_y_channel else 3
-        self.io_channels = channels
         c1, c2 = HIDDEN_CHANNELS
         k1, k2, k3 = KERNEL_SIZES
         self.feature = nn.Sequential(
@@ -72,7 +72,7 @@ class ESPCN(nn.Module):
         nn.init.zeros_(self.last.bias)
 
     def _network(self, x: torch.Tensor) -> torch.Tensor:
-        """LR 공간 특징 추출 → sub-pixel 확대. 입력·출력 채널 수는 `io_channels`."""
+        """LR 공간 특징 추출 → sub-pixel 확대. 입력·출력 채널 수는 같다(RGB 3 또는 Y 1)."""
         return self.upsample(self.last(self.feature(x)))
 
     def forward_raw(self, lr_rgb: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -82,6 +82,8 @@ class ESPCN(nn.Module):
         """
         if lr_rgb.ndim != 4 or lr_rgb.shape[1] != 3:
             raise ValueError(f"lr_rgb는 (B, 3, H, W) 텐서여야 합니다: {tuple(lr_rgb.shape)}")
+        if not lr_rgb.is_floating_point():
+            raise ValueError(f"lr_rgb는 float 텐서여야 합니다: {lr_rgb.dtype}")
         if self.use_y_channel or self.use_global_residual:
             raise NotImplementedError("TODO(T3.4): 스위치 B(Y 채널)·C(bicubic 확대 + 예측 차이) 경로")
         return {"sr_rgb": self._network(lr_rgb)}

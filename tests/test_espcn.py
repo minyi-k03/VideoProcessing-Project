@@ -1,39 +1,75 @@
 """베이스라인 ESPCN 바깥 동작 테스트 (SPEC.md US21·75, ADR-0002, Task T2.1).
 
+모델 내부 층·속성에 접근하지 않고 `forward`/`forward_raw`/파라미터로 보이는 동작만 검증한다.
 합성 데이터만 쓰므로 로컬 CPU에서 돈다. 스위치 B·C 동작은 `test_model_and_loss.py`(T3.4)에서 검증한다.
 """
 
 from __future__ import annotations
 
+import random
+from collections.abc import Iterator
+
+import numpy as np
 import pytest
 import torch
-from torch import nn
 
+from sr_pipeline.common.seed import set_model_seed
 from sr_pipeline.evaluation.benchmark import count_parameters
 from sr_pipeline.models.espcn import ESPCN
 
 
-@pytest.fixture
-def lr_rgb() -> torch.Tensor:
+@pytest.fixture(autouse=True)
+def _restore_global_random_state() -> Iterator[None]:
+    """set_model_seed가 바꾸는 프로세스 전역 상태를 테스트마다 되돌린다(test_seed.py와 같은 방식)."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    cudnn_flags = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+    yield
+    random.setstate(python_state)
+    np.random.set_state(numpy_state)
+    torch.set_rng_state(torch_state)
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = cudnn_flags
+
+
+def _synthetic_lr(batch: int = 2, height: int = 12, width: int = 17) -> torch.Tensor:
     generator = torch.Generator().manual_seed(0)
-    return torch.rand(2, 3, 12, 17, generator=generator)
+    return torch.rand(batch, 3, height, width, generator=generator)
+
+
+def _fit_constant(target: float, steps: int = 200) -> torch.Tensor:
+    """출력이 상수 `target`이 되도록 짧게 학습한 뒤의 출력을 돌려준다(바깥 인터페이스만 사용)."""
+    set_model_seed(0)
+    model = ESPCN()
+    lr = _synthetic_lr(1, 6, 6)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    for _ in range(steps):
+        optimizer.zero_grad()
+        ((model(lr) - target) ** 2).mean().backward()
+        optimizer.step()
+    with torch.no_grad():
+        return model(lr)
 
 
 @pytest.mark.parametrize("height, width", [(12, 17), (1, 1), (45, 80)])
 def test_baseline_output_is_rgb_x4(height: int, width: int) -> None:
-    lr = torch.rand(2, 3, height, width)
-    sr = ESPCN(scale=4)(lr)
+    lr = _synthetic_lr(2, height, width)
+    sr = ESPCN()(lr)
     assert sr.shape == (2, 3, 4 * height, 4 * width)
     assert sr.dtype == lr.dtype
     assert torch.isfinite(sr).all()
 
 
-def test_forward_raw_returns_sr_rgb_matching_forward(lr_rgb: torch.Tensor) -> None:
+def test_forward_raw_returns_sr_rgb_matching_forward() -> None:
+    lr = _synthetic_lr()
     model = ESPCN().eval()
     with torch.no_grad():
-        raw = model.forward_raw(lr_rgb)
+        raw = model.forward_raw(lr)
         assert set(raw) == {"sr_rgb"}
-        assert torch.equal(raw["sr_rgb"], model(lr_rgb))
+        assert torch.equal(raw["sr_rgb"], model(lr))
 
 
 def test_parameter_counts_match_spec() -> None:
@@ -42,48 +78,50 @@ def test_parameter_counts_match_spec() -> None:
     assert count_parameters(ESPCN(use_y_channel=True)) == 24_752
 
 
-def test_structure_tanh_hidden_and_linear_last() -> None:
-    model = ESPCN()
-    activations = [m for m in model.modules() if not isinstance(m, (nn.Conv2d, nn.Sequential, ESPCN, nn.PixelShuffle))]
-    assert len(activations) == 2 and all(isinstance(m, nn.Tanh) for m in activations)
-    # 마지막 층은 활성화 없음: 출력이 tanh 범위 [-1, 1]에 묶이지 않는다.
-    with torch.no_grad():
-        model.last.bias.fill_(2.0)
-        assert (model(torch.rand(1, 3, 4, 4)) > 1.0).all()
+@pytest.mark.parametrize("target", [1.5, -0.5])
+def test_output_can_leave_unit_range(target: float) -> None:
+    """마지막 층에 활성화가 없고 [0, 1]로 자르지 않으므로, 학습하면 출력이 [0, 1] 밖으로 나갈 수 있다.
 
-
-def test_output_is_not_clipped_to_unit_range() -> None:
-    """손실은 자르지 않은 출력으로 계산하므로 모델은 [0, 1]로 자르지 않는다."""
-    model = ESPCN()
-    with torch.no_grad():
-        model.last.bias.fill_(-0.5)
-        assert (model(torch.rand(1, 3, 4, 4)) < 0.0).all()
+    마지막 층에 tanh·sigmoid가 있거나 출력을 자르면 1.5나 -0.5에 도달할 수 없다.
+    """
+    sr = _fit_constant(target)
+    assert (sr > 1.0).all() if target > 1.0 else (sr < 0.0).all()
+    assert abs(sr.mean().item() - target) < 0.05
 
 
 def test_same_seed_gives_same_initialization() -> None:
-    torch.manual_seed(123)
-    first = ESPCN().state_dict()
-    torch.manual_seed(123)
-    second = ESPCN().state_dict()
-    torch.manual_seed(456)
-    third = ESPCN().state_dict()
-    assert all(torch.equal(first[k], second[k]) for k in first)
-    assert not all(torch.equal(first[k], third[k]) for k in first)
+    lr = _synthetic_lr()
+    outputs = {}
+    for name, seed in [("first", 0), ("same", 0), ("other", 1)]:
+        set_model_seed(seed)
+        with torch.no_grad():
+            outputs[name] = ESPCN()(lr)
+    assert torch.equal(outputs["first"], outputs["same"])
+    assert not torch.equal(outputs["first"], outputs["other"])
 
 
-def test_gradients_flow_to_all_parameters(lr_rgb: torch.Tensor) -> None:
+def test_gradients_flow_to_all_parameters() -> None:
     model = ESPCN()
-    model(lr_rgb).abs().mean().backward()
+    model(_synthetic_lr()).abs().mean().backward()
     for name, param in model.named_parameters():
         assert param.grad is not None and torch.isfinite(param.grad).all(), name
         assert param.grad.abs().sum() > 0, name
 
 
-def test_rejects_non_rgb_input() -> None:
+@pytest.mark.parametrize(
+    "lr",
+    [torch.rand(1, 1, 8, 8), torch.rand(3, 8, 8), torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)],
+    ids=["one-channel", "no-batch-dim", "uint8"],
+)
+def test_rejects_invalid_input(lr: torch.Tensor) -> None:
     with pytest.raises(ValueError):
-        ESPCN()(torch.rand(1, 1, 8, 8))
+        ESPCN()(lr)
+
+
+@pytest.mark.parametrize("scale", [2, 3])
+def test_rejects_scale_other_than_x4(scale: int) -> None:
     with pytest.raises(ValueError):
-        ESPCN()(torch.rand(3, 8, 8))
+        ESPCN(scale=scale)
 
 
 def test_runs_on_given_device() -> None:
