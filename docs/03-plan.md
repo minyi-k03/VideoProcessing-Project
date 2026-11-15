@@ -20,6 +20,7 @@
 - T0.1 통과: 두 팀원 모두 VS Code Colab 확장에서 T4 연결, Drive 마운트, 원격 push를 확인했다(차가원 11/15, 점검용 브랜치 push·삭제). 대체 경로는 쓰지 않는다.
 - `models/espcn.py` 베이스라인(RGB, 은닉층 tanh, 마지막 층 활성화 없음, x4 sub-pixel)이 구현되어 `tests/test_espcn.py`(바깥 동작만 검증)를 통과한다(T2.1 통과, PR #4 리뷰 반영, main 병합은 고용민 승인 대기). 파라미터 수는 RGB 37,200개, Y 24,752개다. 배율은 x4만 받고 float RGB 입력만 받는다. 초기화는 은닉층 N(0, √(2/(out·k²))), 마지막 층 N(0, 0.001), 편향 0으로 모든 구성이 같다. 스위치 B·C 경로는 T3.4에서 구현한다.
 - `losses/sr_loss.py`의 기본 L1(자르지 않은 SR 결과와 HR RGB의 배치·채널·화소 평균)이 구현되어 `tests/test_sr_loss.py`를 통과한다(T2.2 ⚠ 통과, main 병합은 고용민 승인 대기). 스위치 A·B·B′를 켜면 생성 시점에 실패하며, 이 경로는 T3.5에서 구현한다.
+- `diagnosis/diagnostics.py`의 진단 5종(Y 오차 지도, HR Y Sobel 상위 q% 에지·평탄 PSNR(Y), 2D FFT 반지름 스펙트럼·대역 에너지 비, YCbCr 채널별 MSE 비중, 테스트셋별 최악 영상)과 `run_diagnosis_suite`(입력 `<HR 루트>/<데이터셋>/HR/<image_id>.png`, `<SR 루트>/<데이터셋>/<image_id>.png`, 가장자리 4화소 자르기 후 CSV 3개·그림 저장)가 구현되어 `tests/test_diagnostics.py`를 통과한다(T2.3 통과, main 병합은 고용민 승인 대기). PSNR·에지 영역 계산은 T2.4 전이라 진단 모듈 안 비공개 함수로 두었고, T3.6에서 metrics와 공유할지 정한다. `scripts/run_pilot_diagnosis.py` 연결은 T2.5에서 한다.
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, 11/15 main 병합 완료).
 - `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, 11/15 main 병합 완료).
 - `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, 11/15 main 병합 완료). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
@@ -106,7 +107,7 @@ x4 SR 개선 실험
 | --- | --- | --- | --- | --- | --- | --- |
 | T2.1 | `models/espcn.py` 베이스라인: RGB 입력, sub-pixel, 은닉층 tanh, 마지막 층 활성화 없음 | 차가원 | — | 21, 75 | 합성 데이터로 순전파·출력 크기 테스트 통과 | 통과 |
 | T2.2 ⚠ | `losses/sr_loss.py` L1 (자르지 않은 출력 사용) | 차가원 | — | 22(일부), 30 | 손실 테스트 통과 | 통과 |
-| T2.3 | `diagnosis/diagnostics.py`: 오차 지도, 에지·평탄 PSNR(Y), 주파수 스펙트럼, YCbCr 채널별 오차, 최악 영상 목록 | 차가원 | T1.1 | 52–56 | 합성 SR/HR 쌍으로 5종 산출물 생성 | 대기 |
+| T2.3 | `diagnosis/diagnostics.py`: 오차 지도, 에지·평탄 PSNR(Y), 주파수 스펙트럼, YCbCr 채널별 오차, 최악 영상 목록 | 차가원 | T1.1 | 52–56 | 합성 SR/HR 쌍으로 5종 산출물 생성 | 통과 |
 | T2.4 ⚠ | `evaluation/postprocess.py`(자르기 → 8비트 → 가장자리 4화소 → Y) + `metrics.py` PSNR(Y)·SSIM(Y) | 고용민 | T1.1 | 41 | 같은 영상 PSNR=∞·SSIM=1, 가장자리 무영향 테스트 통과 | 대기 |
 | T2.5 | `scripts/run_pilot_diagnosis.py` 최소 기능: 파일럿 베이스라인 1시드 학습 + 진단 4종 실행 (Colab) | 고용민·차가원 | T1.4, T2.1–T2.4 | 51 | `results/pilot/`에 진단 그림·표 커밋 | 대기 |
 
