@@ -1,7 +1,7 @@
 """기본 L1 손실 바깥 동작 테스트 (SPEC.md US22 일부·US30, AGENTS.md, Task T2.2).
 
 `SRLoss`의 입력(`forward_raw` 형식의 dict, HR RGB)과 반환값·기울기만 검증한다.
-스위치 A·B·B′ 동작은 `test_model_and_loss.py`(T3.5)에서 검증한다.
+스위치 A·B·B′ 동작은 `test_model_and_loss.py`에서 검증한다.
 """
 
 from __future__ import annotations
@@ -82,14 +82,3 @@ def test_works_with_espcn_forward_raw() -> None:
 def test_rejects_invalid_input(sr: torch.Tensor, hr: torch.Tensor) -> None:
     with pytest.raises(ValueError):
         _loss(sr, hr)
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [{"use_edge_loss": True, "edge_loss_lambda": 0.1}, {"use_y_loss": True}],
-    ids=["switch-A", "switch-B"],
-)
-def test_switches_not_yet_available(kwargs: dict) -> None:
-    """T3.5 전까지는 잘못된 구성이 학습 시작 전에 실패해야 한다."""
-    with pytest.raises(NotImplementedError):
-        SRLoss(**kwargs)

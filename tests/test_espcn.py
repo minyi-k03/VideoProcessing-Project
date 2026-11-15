@@ -6,10 +6,6 @@
 
 from __future__ import annotations
 
-import random
-from collections.abc import Iterator
-
-import numpy as np
 import pytest
 import torch
 
@@ -18,21 +14,7 @@ from sr_pipeline.evaluation.benchmark import count_parameters
 from sr_pipeline.models.espcn import ESPCN
 
 
-@pytest.fixture(autouse=True)
-def _restore_global_random_state() -> Iterator[None]:
-    """set_model_seed가 바꾸는 프로세스 전역 상태를 테스트마다 되돌린다(test_seed.py와 같은 방식)."""
-    python_state = random.getstate()
-    numpy_state = np.random.get_state()
-    torch_state = torch.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    cudnn_flags = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
-    yield
-    random.setstate(python_state)
-    np.random.set_state(numpy_state)
-    torch.set_rng_state(torch_state)
-    if cuda_states is not None:
-        torch.cuda.set_rng_state_all(cuda_states)
-    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = cudnn_flags
+pytestmark = pytest.mark.usefixtures("restore_global_random_state")
 
 
 def _synthetic_lr(batch: int = 2, height: int = 12, width: int = 17) -> torch.Tensor:
