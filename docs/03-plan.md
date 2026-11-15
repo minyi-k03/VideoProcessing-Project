@@ -21,12 +21,13 @@
 - `models/espcn.py` 베이스라인(RGB, 은닉층 tanh, 마지막 층 활성화 없음, x4 sub-pixel)이 구현되어 `tests/test_espcn.py`(바깥 동작만 검증)를 통과한다(T2.1 통과, PR #4 리뷰 반영, main 병합은 고용민 승인 대기). 파라미터 수는 RGB 37,200개, Y 24,752개다. 배율은 x4만 받고 float RGB 입력만 받는다. 초기화는 은닉층 N(0, √(2/(out·k²))), 마지막 층 N(0, 0.001), 편향 0으로 모든 구성이 같다. 스위치 B·C 경로는 T3.4에서 구현한다.
 - `losses/sr_loss.py`의 기본 L1(자르지 않은 SR 결과와 HR RGB의 배치·채널·화소 평균)이 구현되어 `tests/test_sr_loss.py`를 통과한다(T2.2 ⚠ 통과, main 병합은 고용민 승인 대기). 스위치 A·B·B′를 켜면 생성 시점에 실패하며, 이 경로는 T3.5에서 구현한다.
 - `diagnosis/diagnostics.py`의 진단 5종(Y 오차 지도, HR Y Sobel 상위 q% 에지·평탄 PSNR(Y), 2D FFT 반지름 스펙트럼·대역 에너지 비, YCbCr 채널별 MSE 비중, 테스트셋별 최악 영상)과 `run_diagnosis_suite`(입력 `<HR 루트>/<데이터셋>/HR/<image_id>.png`, `<SR 루트>/<데이터셋>/<image_id>.png`, 가장자리 4화소 자르기 후 CSV 3개·그림 저장)가 구현되어 `tests/test_diagnostics.py`를 통과한다(T2.3 통과, main 병합은 고용민 승인 대기). PSNR·에지 영역 계산은 T2.4 전이라 진단 모듈 안 비공개 함수로 두었고, T3.6에서 metrics와 공유할지 정한다. `scripts/run_pilot_diagnosis.py` 연결은 T2.5에서 한다.
+- `evaluation/postprocess.py`(`quantize_and_shave`, `postprocess_to_y`: [0, 1] 자르기 → 8비트 양자화 → 가장자리 잘라내기 → `common.color.rgb_to_y`, `border` 기본값 없이 호출자가 `fair_comparison.yaml` 값을 넘김)와 `evaluation/metrics.py`(`compute_psnr`, `compute_ssim_y`: BasicSR/MATLAB 호환 11×11 가우시안 σ=1.5 valid 합성곱, float64 지표 연산)가 구현되어 `tests/test_evaluation.py`의 T2.4 경계 테스트를 통과한다(T2.4 ⚠ 통과, main 병합은 차가원 승인 대기). 모든 구성이 같은 평가 경로를 거치는지 검증과 `compute_edge_psnr`·`compute_lpips`·`evaluator.py`는 T3.6에서 구현한다.
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, 11/15 main 병합 완료).
 - `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, 11/15 main 병합 완료).
 - `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, 11/15 main 병합 완료). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
 - `data/prepare.py`(패치 풀·테스트셋 LR 생성·압축)와 `scripts/prepare_data.py`는 구현되어 합성 데이터 테스트와 Colab 실제 데이터 확인을 통과한다(T1.4 통과, 11/15 main 병합 완료). Gemini 교차 리뷰(클램핑 검증, 실패 시 반쪽 산출물, 입력 검증, OS별 파일 정렬)를 반영했다. Colab에서 DIV2K 800장과 테스트셋 4종(5·14·100·100장)으로 파일럿용 풀(패치 96, 10000개, 시드 42; `patch_pool_id` `div2k_x4_p96_n10000_s42_e8bc539e`, 압축 파일 387MB, 373초)을 만들고, 압축 해제 후 `content_sha256` 재계산과 테스트셋 HR/LR 대응을 확인했다. 시드 고정 합성 영상의 `patch_pool_id`는 Windows와 Colab(Linux)에서 같다. 패치 크기·개수는 필수 인자이며 값은 `fair_comparison.yaml`에 없다. 본 실행 풀은 T4.2에서 확정한 값으로 다시 만든다. 테스트셋은 HR을 4의 배수로 잘라(modcrop, 104장이 잘림) 저장하므로 평가(T2.4)는 저장된 HR만 써야 한다. 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
 - 위 압축 파일(파일럿용 풀 `div2k_x4_p96_n10000_s42_e8bc539e`, 387MB)을 공유 Drive와 Kaggle 비공개 Dataset에 올리고 두 경로에서 내려받아 확인했다(T1.5 통과, `notebooks/t1_5_upload_check.ipynb`). Drive: 로그인 없이 공유 링크(`gdown`)로 받은 zip의 sha256이 원본(`77e4a08f77a9c651cfea613204c5bbc8a6031c63bf2df07b20941a3c5e4e87b8`)과 같고, 해제 후 `content_sha256` 재계산·`patch_pool_id`·테스트셋 4종 HR/LR 대응이 모두 통과했다(Colab). Kaggle: Kaggle이 zip을 자동 해제해 원본 zip 해시는 비교하지 못했고, 해제본의 `content_sha256` 재계산과 `patch_pool_id` 일치로 확인했다(Kaggle 노트북, CPU). 저장소가 Public이라 공유 링크와 Dataset 주소는 기록하지 않는다(팀원에게 따로 전달). 본 실행 풀은 T4.2에서 값을 고정한 뒤 같은 방식으로 다시 올려야 한다.
-- 스켈레톤 테스트 17개가 `@pytest.mark.skip`이다.
+- 스켈레톤 테스트 14개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
 - 이미 완료된 것:
   - `configs/experiments.yaml`(10개 구성)
@@ -108,7 +109,7 @@ x4 SR 개선 실험
 | T2.1 | `models/espcn.py` 베이스라인: RGB 입력, sub-pixel, 은닉층 tanh, 마지막 층 활성화 없음 | 차가원 | — | 21, 75 | 합성 데이터로 순전파·출력 크기 테스트 통과 | 통과 |
 | T2.2 ⚠ | `losses/sr_loss.py` L1 (자르지 않은 출력 사용) | 차가원 | — | 22(일부), 30 | 손실 테스트 통과 | 통과 |
 | T2.3 | `diagnosis/diagnostics.py`: 오차 지도, 에지·평탄 PSNR(Y), 주파수 스펙트럼, YCbCr 채널별 오차, 최악 영상 목록 | 차가원 | T1.1 | 52–56 | 합성 SR/HR 쌍으로 5종 산출물 생성 | 통과 |
-| T2.4 ⚠ | `evaluation/postprocess.py`(자르기 → 8비트 → 가장자리 4화소 → Y) + `metrics.py` PSNR(Y)·SSIM(Y) | 고용민 | T1.1 | 41 | 같은 영상 PSNR=∞·SSIM=1, 가장자리 무영향 테스트 통과 | 대기 |
+| T2.4 ⚠ | `evaluation/postprocess.py`(자르기 → 8비트 → 가장자리 4화소 → Y) + `metrics.py` PSNR(Y)·SSIM(Y) | 고용민 | T1.1 | 41 | 같은 영상 PSNR=∞·SSIM=1, 가장자리 무영향 테스트 통과 | 통과 |
 | T2.5 | `scripts/run_pilot_diagnosis.py` 최소 기능: 파일럿 베이스라인 1시드 학습 + 진단 4종 실행 (Colab) | 고용민·차가원 | T1.4, T2.1–T2.4 | 51 | `results/pilot/`에 진단 그림·표 커밋 | 대기 |
 
 ### M3 진단 분석·정식 파이프라인 (11/15~17)
