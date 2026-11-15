@@ -22,6 +22,9 @@ import math
 import torch
 import torch.nn as nn
 
+from sr_pipeline.common.bicubic import bicubic_resize
+from sr_pipeline.common.color import denormalize_y, normalize_y, rgb_to_ycbcr, ycbcr_to_rgb
+
 SCALE = 4
 HIDDEN_CHANNELS = (64, 32)
 KERNEL_SIZES = (5, 3, 3)
@@ -78,15 +81,31 @@ class ESPCN(nn.Module):
     def forward_raw(self, lr_rgb: torch.Tensor) -> dict[str, torch.Tensor]:
         """RGB SR 결과(자르기 전)와 B 계열 진단용 pre-RGB 정규화 Y를 함께 반환합니다.
 
-        `sr_y_norm`은 B가 켜진 구성에서만 들어간다(T3.4).
+        - 네트워크가 다루는 채널: B 꺼짐이면 RGB, 켜짐이면 정규화된 Y([0, 1]).
+        - C 켜짐: 그 채널의 bicubic 확대 결과에 네트워크 예측 차이를 더한다(B+C면 정규화된 Y에 더함).
+        - B 켜짐: Cb·Cr는 bicubic으로 확대해 복원한 Y와 합쳐 RGB로 되돌린다. 이때 `sr_y_norm`
+          (RGB로 되돌리기 전 정규화된 Y)을 함께 반환한다. 손실(B)과 `psnr_y_pre_rgb`가 쓴다.
         """
         if lr_rgb.ndim != 4 or lr_rgb.shape[1] != 3:
             raise ValueError(f"lr_rgb는 (B, 3, H, W) 텐서여야 합니다: {tuple(lr_rgb.shape)}")
         if not lr_rgb.is_floating_point():
             raise ValueError(f"lr_rgb는 float 텐서여야 합니다: {lr_rgb.dtype}")
-        if self.use_y_channel or self.use_global_residual:
-            raise NotImplementedError("TODO(T3.4): 스위치 B(Y 채널)·C(bicubic 확대 + 예측 차이) 경로")
-        return {"sr_rgb": self._network(lr_rgb)}
+
+        if self.use_y_channel:
+            lr_ycbcr = rgb_to_ycbcr(lr_rgb)
+            x_lr = normalize_y(lr_ycbcr[:, :1])
+        else:
+            x_lr = lr_rgb
+
+        pred = self._network(x_lr)
+        if self.use_global_residual:
+            pred = bicubic_resize(x_lr, float(self.scale)) + pred
+
+        if not self.use_y_channel:
+            return {"sr_rgb": pred}
+        sr_cbcr = bicubic_resize(lr_ycbcr[:, 1:], float(self.scale))
+        sr_rgb = ycbcr_to_rgb(torch.cat([denormalize_y(pred), sr_cbcr], dim=1))
+        return {"sr_rgb": sr_rgb, "sr_y_norm": pred}
 
     def forward(self, lr_rgb: torch.Tensor) -> torch.Tensor:
         """RGB LR 텐서로부터 자르기 전 RGB SR 텐서를 반환합니다."""
