@@ -28,6 +28,7 @@ PIXEL_MAX = 255.0
 # 주파수 대역 경계 (cycles/pixel). Nyquist 0.5를 3등분한다.
 BAND_EDGES = (1.0 / 6.0, 1.0 / 3.0)
 RADIAL_BINS = 64
+LOG_EPS = 1e-8  # log 스펙트럼에서 크기 0을 피하는 값
 WORST_TOP_K = 5
 
 _SOBEL_X = ((-1.0, 0.0, 1.0), (-2.0, 0.0, 2.0), (-1.0, 0.0, 1.0))
@@ -105,8 +106,10 @@ def compute_frequency_spectrum_diff(
     """SR 결과와 HR 영상의 2D FFT 주파수 스펙트럼 및 대역별 에너지를 비교합니다.
 
     `band_energy_ratio`는 저·중·고 대역에서 SR 에너지 / HR 에너지다. 고주파를 잃으면 high < 1.
-    반지름 프로파일은 0~0.5 cycles/pixel을 `RADIAL_BINS`개 구간으로 나눈 평균 크기라
-    영상 크기가 달라도 같은 구간끼리 평균할 수 있다.
+    FFT는 화소 수로 나눈다(norm="forward", DC = 평균 밝기). 반지름 프로파일은 0~0.5 cycles/pixel을
+    `RADIAL_BINS`개 구간으로 나눠 구간마다 에너지 |F|²를 합한 값이다. 파스발 정리로 전체 합이
+    영상의 평균 제곱 밝기와 같으므로, 같은 밝기·무늬면 영상 크기와 관계없이 같은 프로파일이 나와
+    크기가 다른 영상끼리 평균해도 큰 영상이 과대 반영되지 않는다.
     """
     _check_pair(sr_y, hr_y, 1, "y")
     height, width = hr_y.shape[-2:]
@@ -114,7 +117,7 @@ def compute_frequency_spectrum_diff(
     freq_x = torch.fft.fftfreq(width, dtype=torch.float64).view(1, -1)
     radius = (freq_y.pow(2) + freq_x.pow(2)).sqrt()
 
-    spectra = {name: torch.fft.fft2(y[0, 0].double()).abs() for name, y in (("sr", sr_y), ("hr", hr_y))}
+    spectra = {name: torch.fft.fft2(y[0, 0].double(), norm="forward").abs() for name, y in (("sr", sr_y), ("hr", hr_y))}
 
     bands = {
         "low": radius < BAND_EDGES[0],
@@ -133,14 +136,14 @@ def compute_frequency_spectrum_diff(
     bin_index = torch.clamp((radius / 0.5 * RADIAL_BINS).long(), max=RADIAL_BINS)  # RADIAL_BINS = 0.5 초과(버림)
     radial = {}
     for name, spectrum in spectra.items():
-        sums = torch.zeros(RADIAL_BINS + 1, dtype=torch.float64).index_add_(0, bin_index.flatten(), spectrum.flatten())
-        counts = torch.bincount(bin_index.flatten(), minlength=RADIAL_BINS + 1).double()
-        radial[name] = (sums / counts.clamp(min=1))[:RADIAL_BINS].numpy()
+        energy = torch.zeros(RADIAL_BINS + 1, dtype=torch.float64)
+        energy.index_add_(0, bin_index.flatten(), spectrum.pow(2).flatten())
+        radial[name] = energy[:RADIAL_BINS].numpy()
     radial_freq = (np.arange(RADIAL_BINS) + 0.5) * 0.5 / RADIAL_BINS
 
     return {
-        "sr_log_spectrum": torch.fft.fftshift(torch.log1p(spectra["sr"])),
-        "hr_log_spectrum": torch.fft.fftshift(torch.log1p(spectra["hr"])),
+        "sr_log_spectrum": torch.fft.fftshift(torch.log10(spectra["sr"] + LOG_EPS)),
+        "hr_log_spectrum": torch.fft.fftshift(torch.log10(spectra["hr"] + LOG_EPS)),
         "radial_freq": radial_freq,
         "sr_radial": radial["sr"],
         "hr_radial": radial["hr"],
@@ -239,7 +242,7 @@ def _save_figures(
         for edge in BAND_EDGES:
             ax.axvline(edge, color="gray", linestyle=":", linewidth=1)
         ax.set_xlabel("spatial frequency (cycles/pixel)")
-        ax.set_ylabel("mean |FFT| (Y)")
+        ax.set_ylabel("energy per band |F|² (Y)")
         ax.set_title(f"{dataset}: radial spectrum")
         ax.legend()
         fig.savefig(output_dir / f"spectrum_{dataset}.png", dpi=120, bbox_inches="tight")
@@ -270,13 +273,16 @@ def run_diagnosis_suite(
     sr_dir: Path,
     hr_dir: Path,
     output_dir: Path,
-    top_q_percent: float = 20.0,
-    shave_border: int = 4,
+    *,
+    top_q_percent: float,
+    shave_border: int,
 ) -> None:
     """진단 4종 그림/수치와 테스트셋별 최악 영상 목록을 `output_dir`에 저장합니다.
 
     입력: `hr_dir/<데이터셋>/HR/<image_id>.png`, `sr_dir/<데이터셋>/<image_id>.png` (8비트 PNG).
-    `shave_border`는 `fair_comparison.yaml`의 `shave_border`(4)와 같은 값을 넘긴다.
+    `top_q_percent`(`edge_top_q`)와 `shave_border`는 `fair_comparison.yaml`에서 읽어 호출하는 쪽이
+    넘긴다. 기본값을 두지 않는 이유: 공정 비교 조건 값은 그 파일 한 곳에만 있고, `edge_top_q`는
+    T4.2에서 확정되기 전이라 코드에 임의 값을 박으면 확정값과 다른 진단이 나올 수 있다.
     """
     sr_dir, hr_dir, output_dir = Path(sr_dir), Path(hr_dir), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

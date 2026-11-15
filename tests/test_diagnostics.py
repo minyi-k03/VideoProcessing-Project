@@ -96,6 +96,21 @@ def test_spectrum_band_ratios_are_one_for_identical_images() -> None:
     assert len(result["radial_freq"]) == len(result["sr_radial"]) == len(result["hr_radial"])
 
 
+def _periodic_y(size: int) -> torch.Tensor:
+    """평균 밝기 120, 주기 8화소 세로 줄무늬 (1, 1, size, size). 주파수 1/8은 32·64 모두 정확한 FFT 구간이다."""
+    x = torch.arange(size, dtype=torch.float32)
+    stripes = 120.0 + 40.0 * torch.cos(2 * math.pi * x / 8)
+    return stripes.expand(size, size).reshape(1, 1, size, size).clone()
+
+
+def test_spectrum_does_not_depend_on_image_size() -> None:
+    """같은 밝기·무늬면 영상 크기가 달라도 스펙트럼이 같아야 테스트셋 평균에서 큰 영상이 과대 반영되지 않는다."""
+    small, large = (compute_frequency_spectrum_diff(y, y)["hr_radial"] for y in (_periodic_y(32), _periodic_y(64)))
+    assert np.allclose(small, large, rtol=1e-4, atol=1e-3)
+    assert small[0] == pytest.approx(120.0**2, rel=1e-6)  # DC 구간 = 평균 밝기²
+    assert np.sort(small)[-2] == pytest.approx(2 * 20.0**2, rel=1e-4)  # 진폭 40 cos → ±1/8에 20씩
+
+
 def test_blur_loses_high_frequency_energy() -> None:
     hr_y = rgb_to_y(_rgb(64, 64))
     ratio = compute_frequency_spectrum_diff(_blur(hr_y, 3), hr_y)["band_energy_ratio"]
@@ -216,4 +231,10 @@ def test_run_diagnosis_suite_requires_matching_sr(tmp_path: Path) -> None:
     _write_png(hr_root / "Set5" / "HR" / "img0.png", _rgb())
     (tmp_path / "sr" / "Set5").mkdir(parents=True)
     with pytest.raises(ValueError):
-        run_diagnosis_suite(tmp_path / "sr", hr_root, tmp_path / "out")
+        run_diagnosis_suite(tmp_path / "sr", hr_root, tmp_path / "out", top_q_percent=20.0, shave_border=4)
+
+
+def test_run_diagnosis_suite_requires_explicit_fair_comparison_values(tmp_path: Path) -> None:
+    """edge_top_q·shave_border는 fair_comparison.yaml 값이라 기본값 없이 호출하는 쪽이 넘겨야 한다."""
+    with pytest.raises(TypeError):
+        run_diagnosis_suite(tmp_path / "sr", tmp_path / "testsets", tmp_path / "out")  # type: ignore[call-arg]
