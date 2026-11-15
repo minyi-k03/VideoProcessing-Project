@@ -17,10 +17,12 @@
 
 ### 현재 상태 (11/15 기준)
 
-- `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, main 병합은 차가원 승인 대기).
-- `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, main 병합은 차가원 승인 대기).
-- `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, main 병합은 차가원 승인 대기). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
-- `data/prepare.py`(패치 풀·테스트셋 LR 생성·압축)와 `scripts/prepare_data.py`는 구현되어 합성 데이터 테스트와 Colab 실제 데이터 확인을 통과한다(T1.4 통과, main 병합은 차가원 승인 대기). Gemini 교차 리뷰(클램핑 검증, 실패 시 반쪽 산출물, 입력 검증, OS별 파일 정렬)를 반영했다. Colab에서 DIV2K 800장과 테스트셋 4종(5·14·100·100장)으로 파일럿용 풀(패치 96, 10000개, 시드 42; `patch_pool_id` `div2k_x4_p96_n10000_s42_e8bc539e`, 압축 파일 387MB, 373초)을 만들고, 압축 해제 후 `content_sha256` 재계산과 테스트셋 HR/LR 대응을 확인했다. 시드 고정 합성 영상의 `patch_pool_id`는 Windows와 Colab(Linux)에서 같다. 패치 크기·개수는 필수 인자이며 값은 `fair_comparison.yaml`에 없다. 본 실행 풀은 T4.2에서 확정한 값으로 다시 만든다. 테스트셋은 HR을 4의 배수로 잘라(modcrop, 104장이 잘림) 저장하므로 평가(T2.4)는 저장된 HR만 써야 한다. 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
+- T0.1 통과: 두 팀원 모두 VS Code Colab 확장에서 T4 연결, Drive 마운트, 원격 push를 확인했다(차가원 11/15, 점검용 브랜치 push·삭제). 대체 경로는 쓰지 않는다.
+- `models/espcn.py` 베이스라인(RGB, 은닉층 tanh, 마지막 층 활성화 없음, x4 sub-pixel)이 구현되어 `tests/test_espcn.py`(바깥 동작만 검증)를 통과한다(T2.1 통과, PR #4 리뷰 반영, main 병합은 고용민 승인 대기). 파라미터 수는 RGB 37,200개, Y 24,752개다. 배율은 x4만 받고 float RGB 입력만 받는다. 초기화는 은닉층 N(0, √(2/(out·k²))), 마지막 층 N(0, 0.001), 편향 0으로 모든 구성이 같다. 스위치 B·C 경로는 T3.4에서 구현한다.
+- `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, 11/15 main 병합 완료).
+- `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, 11/15 main 병합 완료).
+- `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, 11/15 main 병합 완료). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
+- `data/prepare.py`(패치 풀·테스트셋 LR 생성·압축)와 `scripts/prepare_data.py`는 구현되어 합성 데이터 테스트와 Colab 실제 데이터 확인을 통과한다(T1.4 통과, 11/15 main 병합 완료). Gemini 교차 리뷰(클램핑 검증, 실패 시 반쪽 산출물, 입력 검증, OS별 파일 정렬)를 반영했다. Colab에서 DIV2K 800장과 테스트셋 4종(5·14·100·100장)으로 파일럿용 풀(패치 96, 10000개, 시드 42; `patch_pool_id` `div2k_x4_p96_n10000_s42_e8bc539e`, 압축 파일 387MB, 373초)을 만들고, 압축 해제 후 `content_sha256` 재계산과 테스트셋 HR/LR 대응을 확인했다. 시드 고정 합성 영상의 `patch_pool_id`는 Windows와 Colab(Linux)에서 같다. 패치 크기·개수는 필수 인자이며 값은 `fair_comparison.yaml`에 없다. 본 실행 풀은 T4.2에서 확정한 값으로 다시 만든다. 테스트셋은 HR을 4의 배수로 잘라(modcrop, 104장이 잘림) 저장하므로 평가(T2.4)는 저장된 HR만 써야 한다. 나머지 `src/sr_pipeline/` 모듈은 시그니처와 docstring만 있고, 본체는 `NotImplementedError("TODO")`다.
 - 위 압축 파일(파일럿용 풀 `div2k_x4_p96_n10000_s42_e8bc539e`, 387MB)을 공유 Drive와 Kaggle 비공개 Dataset에 올리고 두 경로에서 내려받아 확인했다(T1.5 통과, `notebooks/t1_5_upload_check.ipynb`). Drive: 로그인 없이 공유 링크(`gdown`)로 받은 zip의 sha256이 원본(`77e4a08f77a9c651cfea613204c5bbc8a6031c63bf2df07b20941a3c5e4e87b8`)과 같고, 해제 후 `content_sha256` 재계산·`patch_pool_id`·테스트셋 4종 HR/LR 대응이 모두 통과했다(Colab). Kaggle: Kaggle이 zip을 자동 해제해 원본 zip 해시는 비교하지 못했고, 해제본의 `content_sha256` 재계산과 `patch_pool_id` 일치로 확인했다(Kaggle 노트북, CPU). 저장소가 Public이라 공유 링크와 Dataset 주소는 기록하지 않는다(팀원에게 따로 전달). 본 실행 풀은 T4.2에서 값을 고정한 뒤 같은 방식으로 다시 올려야 한다.
 - 스켈레톤 테스트 17개가 `@pytest.mark.skip`이다.
 - `configs/fair_comparison.yaml`의 파일럿 결정값은 모두 `null`이다.
@@ -83,7 +85,7 @@ x4 SR 개선 실험
 
 | ID | 작업 | 담당 | 선행 | US | 완료 조건 | 상태 |
 | --- | --- | --- | --- | --- | --- | --- |
-| T0.1 | Colab T4 연결, Drive 마운트, 원격 git push 점검. 노트북 01에 push 테스트 셀 추가 | 공통 | — | 1–3 | 두 팀원 모두 T4·마운트·push 성공(또는 대체 경로 확정) | 진행 |
+| T0.1 | Colab T4 연결, Drive 마운트, 원격 git push 점검. 노트북 01에 push 테스트 셀 추가 | 공통 | — | 1–3 | 두 팀원 모두 T4·마운트·push 성공(또는 대체 경로 확정) | 통과 |
 | T0.2 | `AGENTS.md` 작성(용어집·ADR 준수, ⚠ 규칙, 병합 후 즉시 반영, 마감 직전 우회 병합 절차), `@AGENTS.md` 한 줄 `CLAUDE.md`, verify = `pytest` + `python scripts/sync_skills.py --check` | 공통 기반 | — | 69–74 | 세 에이전트에서 규칙 인식 확인, verify 로컬 CPU 수 분 내 통과 | 통과 |
 | T0.3 | Skills 설치 결정 ADR 작성, `.agents/`·`.claude/`·`scripts/sync_skills.py` 커밋 | 공통 기반 | — | — | ADR 커밋, `/스킬명` 호출 확인 | 통과 |
 
@@ -101,7 +103,7 @@ x4 SR 개선 실험
 
 | ID | 작업 | 담당 | 선행 | US | 완료 조건 | 상태 |
 | --- | --- | --- | --- | --- | --- | --- |
-| T2.1 | `models/espcn.py` 베이스라인: RGB 입력, sub-pixel, 은닉층 tanh, 마지막 층 활성화 없음 | 차가원 | — | 21, 75 | 합성 데이터로 순전파·출력 크기 테스트 통과 | 대기 |
+| T2.1 | `models/espcn.py` 베이스라인: RGB 입력, sub-pixel, 은닉층 tanh, 마지막 층 활성화 없음 | 차가원 | — | 21, 75 | 합성 데이터로 순전파·출력 크기 테스트 통과 | 통과 |
 | T2.2 ⚠ | `losses/sr_loss.py` L1 (자르지 않은 출력 사용) | 차가원 | — | 22(일부), 30 | 손실 테스트 통과 | 대기 |
 | T2.3 | `diagnosis/diagnostics.py`: 오차 지도, 에지·평탄 PSNR(Y), 주파수 스펙트럼, YCbCr 채널별 오차, 최악 영상 목록 | 차가원 | T1.1 | 52–56 | 합성 SR/HR 쌍으로 5종 산출물 생성 | 대기 |
 | T2.4 ⚠ | `evaluation/postprocess.py`(자르기 → 8비트 → 가장자리 4화소 → Y) + `metrics.py` PSNR(Y)·SSIM(Y) | 고용민 | T1.1 | 41 | 같은 영상 PSNR=∞·SSIM=1, 가장자리 무영향 테스트 통과 | 대기 |
