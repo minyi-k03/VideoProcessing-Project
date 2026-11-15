@@ -4,7 +4,7 @@
 - 기본: L1 (화소·채널 평균)
 - A 활성화 시: L1 + λ * L1(Sobel 수평·수직 성분 차이), 크기(√) 미사용
 - B 또는 B′ 활성화 시: 정규화된 BT.601 Y 채널에서 두 항 계산
-- 손실 계산에는 자르지 않은([0, 1] clamp 전) 출력을 사용
+- 손실 계산에는 자르지 않은([0, 1] clamp 전) SR 결과를 사용
 
 구현 범위: 기본 L1(T2.2). 스위치 A·B·B′ 경로는 T3.5에서 구현한다.
 """
@@ -49,7 +49,7 @@ class SRLoss(nn.Module):
         sr_outputs: dict[str, torch.Tensor],
         hr_rgb: torch.Tensor,
     ) -> torch.Tensor:
-        """자르기 전 SR 출력과 HR RGB 간 손실을 계산합니다.
+        """자르기 전 SR 결과와 HR RGB 간 손실을 계산합니다.
 
         `sr_outputs`는 모델 `forward_raw`의 반환값이다. 기본 구성은 `sr_rgb`만 쓴다.
         배치·채널·화소 전체 평균 L1이며, [0, 1] 자르기나 양자화를 하지 않는다.
