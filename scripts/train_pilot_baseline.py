@@ -1,6 +1,7 @@
 """파일럿 베이스라인 1시드 학습 + SR 결과 생성 CLI 진입점 (SPEC.md / User Story 51, Task T2.5).
 
 정식 파이프라인(T3.7)이 끝나기 전에 진단 입력을 만드는 파일럿 전용 스크립트다. 순서:
+0. 학습 전에 설정 파일 구조, 테스트셋 LR 폴더, `--sr-dir`가 아직 없는지 확인한다(긴 학습 뒤 실패하지 않게).
 1. `<data-dir>/patch_pool`로 베이스라인 ESPCN을 학습하고 체크포인트를 `--checkpoint-path`에 저장한다.
 2. `<data-dir>/testsets/<데이터셋>/LR`의 SR 결과를 `--sr-dir`에 만든다. 데이터셋 이름은 공정 비교 조건 파일의
    `fixed_rules.datasets`에서 읽는다.
@@ -19,16 +20,21 @@ from pathlib import Path
 import torch
 import yaml
 
-from sr_pipeline.engine.pilot import generate_sr_results, train_pilot_baseline
+from sr_pipeline.engine.pilot import (
+    collect_testset_lr_images,
+    generate_sr_results,
+    resolve_testset_names,
+    train_pilot_baseline,
+)
 
 SETTINGS_FILENAME = "pilot_train_settings.json"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the pilot baseline (1 seed) and write SR outputs for diagnosis.")
+    parser = argparse.ArgumentParser(description="Train the pilot baseline (1 seed) and write SR results for diagnosis.")
     parser.add_argument("--data-dir", type=Path, required=True, help="Prepared data root (patch_pool/, testsets/).")
     parser.add_argument("--checkpoint-path", type=Path, required=True, help="Checkpoint file to write (keep on Drive).")
-    parser.add_argument("--sr-dir", type=Path, required=True, help="Where to write SR outputs (<dataset>/<image_id>.png).")
+    parser.add_argument("--sr-dir", type=Path, required=True, help="Where to write SR results (<dataset>/<image_id>.png); must not exist yet.")
     parser.add_argument(
         "--output-dir", type=Path, default=Path("results/pilot"), help="Where to write pilot_train_settings.json."
     )
@@ -52,7 +58,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     with args.fair_comparison_config.open(encoding="utf-8") as file:
-        dataset_names = yaml.safe_load(file)["fixed_rules"]["datasets"]
+        dataset_names = resolve_testset_names(yaml.safe_load(file))
+    testsets_dir = args.data_dir / "testsets"
+    collect_testset_lr_images(testsets_dir, dataset_names)
+    if args.sr_dir.exists():
+        raise FileExistsError(f"--sr-dir {args.sr_dir}가 이미 있습니다. 지우거나 다른 경로를 쓰세요.")
 
     record = train_pilot_baseline(
         args.data_dir,
@@ -65,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
         device=args.device,
     )
     counts = generate_sr_results(
-        args.checkpoint_path, args.data_dir / "testsets", args.sr_dir, dataset_names, device=args.device
+        args.checkpoint_path, testsets_dir, args.sr_dir, dataset_names, device=args.device
     )
     record["sr_image_counts"] = counts
 
