@@ -306,10 +306,10 @@ def test_train_to_pilot_diagnosis_end_to_end(data_dir: Path, tmp_path: Path) -> 
     checkpoint, sr_dir, output_dir = tmp_path / "pilot.pth", tmp_path / "sr", tmp_path / "pilot_out"
     train_pilot_baseline(data_dir, checkpoint, **TRAIN_KWARGS)
     generate_sr_results(checkpoint, data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
-    fair_comparison = {"fixed_rules": {"shave_border": 4}, "pilot_determined": {"edge_top_q": None}}
+    fair_comparison = {"fixed_rules": {"shave_border": 4, "datasets": ["SetA"]}, "pilot_determined": {"edge_top_q": None}}
 
     settings = run_pilot_diagnosis(
-        sr_dir, data_dir / "testsets", output_dir, fair_comparison, edge_top_q=20.0
+        sr_dir, data_dir / "testsets", output_dir, fair_comparison, commit="test", edge_top_q=20.0
     )
 
     assert settings["shave_border"] == 4
