@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -322,3 +323,68 @@ def run_diagnosis_suite(
     worst = rank_worst_images(output_dir / "per_image_diagnosis.csv")
     pd.DataFrame(worst).to_csv(output_dir / "worst_images.csv", index=False)
     _save_figures(output_dir, per_image, worst, error_maps, radial, radial_freq)
+
+
+# ---------------------------------------------------------------- 파일럿 진단 (T2.5)
+
+DIAGNOSIS_SETTINGS_FILENAME = "diagnosis_settings.json"
+
+
+def resolve_diagnosis_settings(fair_comparison: dict[str, Any], edge_top_q: float | None) -> dict[str, Any]:
+    """`fair_comparison.yaml` 내용과 명령줄 `edge_top_q`로 진단에 쓸 값을 정합니다.
+
+    - `shave_border`는 `fixed_rules`에서만 읽는다(명령줄로 바꿀 수 없다).
+    - `pilot_determined.edge_top_q`가 있으면 그 값을 쓰고, 명령줄 값이 다르면 오류.
+    - 아직 `null`(T4.2 확정 전)이면 명령줄 값이 필요하다. 코드에 임의 기본값을 두지 않고,
+      파일럿에서 쓴 값과 출처를 결과에 남기기 위해서다.
+    """
+    fixed_rules = fair_comparison.get("fixed_rules") or {}
+    if "shave_border" not in fixed_rules:
+        raise ValueError("fair_comparison.yaml의 fixed_rules에 shave_border가 없습니다.")
+    shave_border = int(fixed_rules["shave_border"])
+
+    configured_q = (fair_comparison.get("pilot_determined") or {}).get("edge_top_q")
+    if configured_q is None:
+        if edge_top_q is None:
+            raise ValueError(
+                "fair_comparison.yaml의 pilot_determined.edge_top_q가 아직 null입니다(T4.2 확정 전). "
+                "파일럿에서 쓸 값을 --edge-top-q로 넘기세요."
+            )
+        top_q, source = float(edge_top_q), "command_line"
+    else:
+        if edge_top_q is not None and float(edge_top_q) != float(configured_q):
+            raise ValueError(
+                f"--edge-top-q {edge_top_q}가 fair_comparison.yaml의 edge_top_q {configured_q}와 다릅니다. "
+                "확정된 공정 비교 조건 값은 명령줄로 바꿀 수 없습니다."
+            )
+        top_q, source = float(configured_q), "fair_comparison"
+    if not 0.0 < top_q < 100.0:
+        raise ValueError(f"edge_top_q는 0과 100 사이여야 합니다: {top_q}")
+    return {"edge_top_q": top_q, "edge_top_q_source": source, "shave_border": shave_border}
+
+
+def run_pilot_diagnosis(
+    sr_dir: Path,
+    hr_dir: Path,
+    output_dir: Path,
+    fair_comparison: dict[str, Any],
+    *,
+    edge_top_q: float | None = None,
+) -> dict[str, Any]:
+    """파일럿 SR 결과로 진단 4종을 돌리고, 쓴 설정을 `diagnosis_settings.json`에 남깁니다 (US 51).
+
+    입력 폴더 구조와 산출물은 `run_diagnosis_suite`와 같다. 설정이 잘못되면 산출물을 만들기 전에 실패한다.
+    반환값은 기록한 설정이다.
+    """
+    settings = resolve_diagnosis_settings(fair_comparison, edge_top_q)
+    run_diagnosis_suite(
+        sr_dir,
+        hr_dir,
+        output_dir,
+        top_q_percent=settings["edge_top_q"],
+        shave_border=settings["shave_border"],
+    )
+    record = {**settings, "sr_dir": str(sr_dir), "hr_dir": str(hr_dir)}
+    with (Path(output_dir) / DIAGNOSIS_SETTINGS_FILENAME).open("w", encoding="utf-8") as file:
+        json.dump(record, file, ensure_ascii=False, indent=2)
+    return record

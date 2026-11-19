@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import math
 from pathlib import Path
 
@@ -22,7 +24,9 @@ from sr_pipeline.diagnosis.diagnostics import (
     compute_frequency_spectrum_diff,
     decompose_ycbcr_error,
     rank_worst_images,
+    resolve_diagnosis_settings,
     run_diagnosis_suite,
+    run_pilot_diagnosis,
 )
 
 
@@ -238,3 +242,88 @@ def test_run_diagnosis_suite_requires_explicit_fair_comparison_values(tmp_path: 
     """edge_top_q·shave_border는 fair_comparison.yaml 값이라 기본값 없이 호출하는 쪽이 넘겨야 한다."""
     with pytest.raises(TypeError):
         run_diagnosis_suite(tmp_path / "sr", tmp_path / "testsets", tmp_path / "out")  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------- 파일럿 진단 CLI (T2.5)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _fair_comparison(edge_top_q: float | None, shave_border: int | None = 4) -> dict:
+    fixed_rules = {} if shave_border is None else {"shave_border": shave_border}
+    return {"fixed_rules": fixed_rules, "pilot_determined": {"edge_top_q": edge_top_q}}
+
+
+def test_settings_use_fair_comparison_values_when_fixed() -> None:
+    settings = resolve_diagnosis_settings(_fair_comparison(15.0, shave_border=6), edge_top_q=None)
+    assert settings == {"edge_top_q": 15.0, "edge_top_q_source": "fair_comparison", "shave_border": 6}
+
+
+def test_settings_accept_matching_command_line_q_when_fixed() -> None:
+    settings = resolve_diagnosis_settings(_fair_comparison(15.0), edge_top_q=15.0)
+    assert settings["edge_top_q_source"] == "fair_comparison"
+
+
+def test_settings_require_command_line_q_while_unfixed() -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(None), edge_top_q=None)
+
+
+def test_settings_use_command_line_q_while_unfixed() -> None:
+    settings = resolve_diagnosis_settings(_fair_comparison(None), edge_top_q=20.0)
+    assert settings == {"edge_top_q": 20.0, "edge_top_q_source": "command_line", "shave_border": 4}
+
+
+def test_settings_reject_command_line_q_different_from_fixed() -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(15.0), edge_top_q=20.0)
+
+
+@pytest.mark.parametrize("q", [0.0, 100.0, -1.0])
+def test_settings_reject_invalid_q(q: float) -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(None), edge_top_q=q)
+
+
+def test_settings_require_shave_border_in_fixed_rules() -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(None, shave_border=None), edge_top_q=20.0)
+
+
+def _load_pilot_script():
+    path = REPO_ROOT / "scripts" / "run_pilot_diagnosis.py"
+    spec = importlib.util.spec_from_file_location("run_pilot_diagnosis", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pilot_diagnosis_cli_reads_repo_config_and_records_settings(tmp_path: Path) -> None:
+    hr_root, sr_root, out = tmp_path / "testsets", tmp_path / "sr", tmp_path / "out"
+    for index in range(2):
+        hr = _rgb(40, 48, seed=index)
+        _write_png(hr_root / "Set5" / "HR" / f"img{index}.png", hr)
+        _write_png(sr_root / "Set5" / f"img{index}.png", _blur(hr, 3))
+
+    _load_pilot_script().main(
+        [
+            "--sr-dir", str(sr_root),
+            "--hr-dir", str(hr_root),
+            "--output-dir", str(out),
+            "--edge-top-q", "20",
+            "--fair-comparison-config", str(REPO_ROOT / "configs" / "fair_comparison.yaml"),
+        ]
+    )
+
+    assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 2
+    settings = json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))
+    assert settings["edge_top_q"] == 20.0
+    assert settings["edge_top_q_source"] == "command_line"
+    assert settings["shave_border"] == 4  # configs/fair_comparison.yaml fixed_rules.shave_border
+
+
+def test_pilot_diagnosis_writes_nothing_when_settings_invalid(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    with pytest.raises(ValueError):
+        run_pilot_diagnosis(tmp_path / "sr", tmp_path / "testsets", out, _fair_comparison(None), edge_top_q=None)
+    assert not out.exists()
