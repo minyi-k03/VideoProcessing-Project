@@ -198,14 +198,30 @@ def _shave(image: torch.Tensor, border: int) -> torch.Tensor:
     return image[..., border:-border, border:-border] if border > 0 else image
 
 
-def _collect_pairs(sr_dir: Path, hr_dir: Path) -> list[tuple[str, str, Path, Path]]:
-    """(dataset, image_id, sr_path, hr_path) 목록. HR 구조는 T1.4 `prepare_testsets` 산출물과 같다."""
-    datasets = sorted(path.name for path in hr_dir.iterdir() if (path / "HR").is_dir())
+def _find_hr_datasets(hr_dir: Path) -> list[str]:
+    """`hr_dir` 아래 `<데이터셋>/HR` 폴더가 있는 데이터셋 이름 목록 (정렬)."""
+    if not hr_dir.is_dir():
+        return []
+    return sorted(path.name for path in hr_dir.iterdir() if (path / "HR").is_dir())
+
+
+def _collect_pairs(
+    sr_dir: Path, hr_dir: Path, datasets: list[str] | None = None
+) -> list[tuple[str, str, Path, Path]]:
+    """(dataset, image_id, sr_path, hr_path) 목록. HR 구조는 T1.4 `prepare_testsets` 산출물과 같다.
+
+    `datasets`를 주면 그 테스트셋만, 주지 않으면 `hr_dir`에서 찾은 테스트셋을 처리한다.
+    HR 영상이 한 장도 없는 테스트셋은 결과에서 조용히 빠지지 않도록 오류로 막는다.
+    """
+    datasets = _find_hr_datasets(hr_dir) if datasets is None else list(datasets)
     if not datasets:
         raise ValueError(f"{hr_dir} 아래에 <데이터셋>/HR 폴더가 없습니다.")
     pairs = []
     for dataset in datasets:
-        for hr_path in sorted((hr_dir / dataset / "HR").glob("*.png")):
+        hr_paths = sorted((hr_dir / dataset / "HR").glob("*.png"))
+        if not hr_paths:
+            raise ValueError(f"테스트셋 {dataset}의 HR 영상(PNG)이 없습니다: {hr_dir / dataset / 'HR'}")
+        for hr_path in hr_paths:
             sr_path = sr_dir / dataset / hr_path.name
             if not sr_path.is_file():
                 raise ValueError(f"HR 영상에 대응하는 SR 결과가 없습니다: {sr_path}")
@@ -279,10 +295,12 @@ def run_diagnosis_suite(
     *,
     top_q_percent: float,
     shave_border: int,
+    datasets: list[str] | None = None,
 ) -> None:
     """진단 4종 그림/수치와 테스트셋별 최악 영상 목록을 `output_dir`에 저장합니다.
 
     입력: `hr_dir/<데이터셋>/HR/<image_id>.png`, `sr_dir/<데이터셋>/<image_id>.png` (8비트 PNG).
+    `datasets`를 주면 그 테스트셋만 진단하고, 주지 않으면 `hr_dir`에서 찾은 테스트셋을 모두 진단한다.
     `top_q_percent`(`edge_top_q`)와 `shave_border`는 `fair_comparison.yaml`에서 읽어 호출하는 쪽이
     넘긴다. 기본값을 두지 않는 이유: 공정 비교 조건 값은 그 파일 한 곳에만 있고, `edge_top_q`는
     T4.2에서 확정되기 전이라 코드에 임의 값을 박으면 확정값과 다른 진단이 나올 수 있다.
@@ -294,7 +312,7 @@ def run_diagnosis_suite(
     error_maps: dict[tuple[str, str], np.ndarray] = {}
     radial: dict[str, dict[str, list[np.ndarray]]] = {}
     radial_freq = np.empty(0)
-    for dataset, image_id, sr_path, hr_path in _collect_pairs(sr_dir, hr_dir):
+    for dataset, image_id, sr_path, hr_path in _collect_pairs(sr_dir, hr_dir, datasets):
         sr_rgb, hr_rgb = _load_rgb(sr_path), _load_rgb(hr_path)
         if sr_rgb.shape != hr_rgb.shape:
             raise ValueError(f"SR 결과와 HR 영상의 크기가 다릅니다: {sr_path} {tuple(sr_rgb.shape)} vs {tuple(hr_rgb.shape)}")
@@ -330,18 +348,21 @@ def run_diagnosis_suite(
 # ---------------------------------------------------------------- 파일럿 진단 (T2.5)
 
 DIAGNOSIS_SETTINGS_FILENAME = "diagnosis_settings.json"
-# 진단이 만들고 다시 실행할 때 통째로 바꾸는 산출물(glob 패턴). 같은 폴더의 다른 파일
-# (예: 파일럿 학습 설정 기록, .gitkeep)은 건드리지 않는다.
-DIAGNOSIS_OUTPUT_PATTERNS = (
+ERROR_MAPS_DIRNAME = "error_maps"
+# 진단이 만드는 이름이 고정된 산출물. 이 밖에 테스트셋별 `spectrum_<데이터셋>.png`와
+# `error_maps/<데이터셋>_<image_id>.png`가 있다(`_diagnosis_owned_files`).
+DIAGNOSIS_FIXED_OUTPUTS = (
     "per_image_diagnosis.csv",
     "summary_diagnosis.csv",
     "worst_images.csv",
     "edge_flat_psnr.png",
     "ycbcr_error_share.png",
-    "spectrum_*.png",
-    "error_maps",
     DIAGNOSIS_SETTINGS_FILENAME,
 )
+
+
+class DiagnosisRestoreError(RuntimeError):
+    """진단 산출물 교체가 실패한 뒤 이전 산출물을 되돌리는 것마저 실패했을 때 냅니다."""
 
 
 def _require_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -404,7 +425,7 @@ def resolve_diagnosis_settings(fair_comparison: dict[str, Any], edge_top_q: floa
 
 def _check_hr_datasets(hr_dir: Path, datasets: list[str]) -> None:
     """HR 영상 폴더의 `<데이터셋>/HR` 목록이 공정 비교 조건의 테스트셋과 정확히 같은지 확인합니다."""
-    found = {path.name for path in Path(hr_dir).iterdir() if (path / "HR").is_dir()} if Path(hr_dir).is_dir() else set()
+    found = set(_find_hr_datasets(Path(hr_dir)))
     missing, extra = sorted(set(datasets) - found), sorted(found - set(datasets))
     if missing or extra:
         raise ValueError(
@@ -412,14 +433,50 @@ def _check_hr_datasets(hr_dir: Path, datasets: list[str]) -> None:
         )
 
 
-def _replace_diagnosis_outputs(staging_dir: Path, output_dir: Path) -> None:
-    """`output_dir`의 진단 산출물을 지우고 `staging_dir`에 만든 새 산출물로 바꿉니다."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for pattern in DIAGNOSIS_OUTPUT_PATTERNS:
-        for stale in output_dir.glob(pattern):
-            shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
-    for fresh in staging_dir.iterdir():
-        shutil.move(str(fresh), str(output_dir / fresh.name))
+def _diagnosis_owned_files(directory: Path, datasets: list[str]) -> list[Path]:
+    """`directory` 안에서 진단이 만든 파일의 상대 경로 목록. 다른 파일(학습 설정 기록, 메모 등)은 넣지 않는다."""
+    candidates = [Path(name) for name in DIAGNOSIS_FIXED_OUTPUTS]
+    candidates += [Path(f"spectrum_{dataset}.png") for dataset in datasets]
+    error_dir = directory / ERROR_MAPS_DIRNAME
+    for dataset in datasets:
+        candidates += [path.relative_to(directory) for path in sorted(error_dir.glob(f"{dataset}_*.png"))]
+    return [path for path in candidates if (directory / path).is_file()]
+
+
+def _replace_diagnosis_outputs(staging_dir: Path, output_dir: Path, backup_dir: Path, datasets: list[str]) -> None:
+    """`output_dir`의 이전 진단 산출물을 `staging_dir`의 새 산출물로 바꿉니다.
+
+    이전 산출물은 지우지 않고 `backup_dir`로 옮겨 두었다가, 도중에 실패하면 옮겨 넣은 새 파일을 빼고
+    이전 산출물을 원래 자리로 되돌린 뒤 예외를 다시 낸다. 되돌리기마저 실패하면 `DiagnosisRestoreError`.
+    """
+    old_files = _diagnosis_owned_files(output_dir, datasets)
+    new_files = sorted(path.relative_to(staging_dir) for path in staging_dir.rglob("*") if path.is_file())
+    error_dir_existed = (output_dir / ERROR_MAPS_DIRNAME).is_dir()
+    moved_aside: list[Path] = []
+    moved_in: list[Path] = []
+    try:
+        for relative in old_files:
+            (backup_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(output_dir / relative), str(backup_dir / relative))
+            moved_aside.append(relative)
+        for relative in new_files:
+            (output_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staging_dir / relative), str(output_dir / relative))
+            moved_in.append(relative)
+    except BaseException as error:
+        try:
+            for relative in moved_in:
+                (output_dir / relative).unlink(missing_ok=True)
+            for relative in moved_aside:
+                shutil.move(str(backup_dir / relative), str(output_dir / relative))
+            error_dir = output_dir / ERROR_MAPS_DIRNAME
+            if not error_dir_existed and error_dir.is_dir() and not any(error_dir.iterdir()):
+                error_dir.rmdir()
+        except BaseException as restore_error:
+            raise DiagnosisRestoreError(
+                f"진단 산출물 교체가 실패했고 이전 산출물을 되돌리지 못했습니다. 이전 산출물은 {backup_dir}에 남아 있습니다."
+            ) from restore_error
+        raise error
 
 
 def run_pilot_diagnosis(
@@ -436,9 +493,9 @@ def run_pilot_diagnosis(
     입력 폴더 구조와 산출물은 `run_diagnosis_suite`와 같다. HR 영상 폴더의 테스트셋은
     `fixed_rules.datasets`와 정확히 같아야 한다. `commit`은 이 진단을 실행한 코드 커밋이다.
 
-    산출물은 옆의 임시 폴더에 모두 만든 뒤 `output_dir`의 이전 진단 산출물과 통째로 바꾼다.
-    그래서 다시 실행해도 이전 오차 지도가 섞이지 않고, 도중에 실패하면 `output_dir`은 그대로다.
-    진단이 만들지 않은 파일(파일럿 학습 설정 기록, `.gitkeep` 등)은 남는다.
+    산출물은 시스템 임시 폴더(저장소 밖)에 모두 만든 뒤 `output_dir`의 이전 진단 산출물과 바꾼다.
+    그래서 다시 실행해도 이전 오차 지도가 섞이지 않고, 진단이나 교체 도중에 실패하면 `output_dir`은
+    이전 상태 그대로다. 진단이 만들지 않은 파일(파일럿 학습 설정 기록, `.gitkeep`, 메모 등)은 남는다.
     결과가 Public 저장소에 커밋되므로 입력 경로는 기록하지 않는다. 반환값은 기록한 설정이다.
     """
     settings = resolve_diagnosis_settings(fair_comparison, edge_top_q)
@@ -447,9 +504,9 @@ def run_pilot_diagnosis(
     _check_hr_datasets(Path(hr_dir), settings["datasets"])
     settings["commit"] = commit.strip()
 
-    output_dir = Path(output_dir)
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
+    work_dir = Path(tempfile.mkdtemp(prefix="pilot_diagnosis_"))
+    staging_dir, backup_dir = work_dir / "staging", work_dir / "backup"
+    keep_work_dir = False
     try:
         run_diagnosis_suite(
             sr_dir,
@@ -457,10 +514,15 @@ def run_pilot_diagnosis(
             staging_dir,
             top_q_percent=settings["edge_top_q"],
             shave_border=settings["shave_border"],
+            datasets=settings["datasets"],
         )
         with (staging_dir / DIAGNOSIS_SETTINGS_FILENAME).open("w", encoding="utf-8") as file:
             json.dump(settings, file, ensure_ascii=False, indent=2)
-        _replace_diagnosis_outputs(staging_dir, output_dir)
+        _replace_diagnosis_outputs(staging_dir, Path(output_dir), backup_dir, settings["datasets"])
+    except DiagnosisRestoreError:
+        keep_work_dir = True  # 되돌리지 못한 이전 산출물이 backup_dir에 있으므로 지우지 않는다.
+        raise
     finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        if not keep_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
     return settings

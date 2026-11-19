@@ -8,6 +8,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -332,8 +334,22 @@ def _run_pilot_cli(sr_root: Path, hr_root: Path, out: Path, config: Path, edge_t
     argv += ["--fair-comparison-config", str(config)]
     if edge_top_q is not None:
         argv += ["--edge-top-q", edge_top_q]
-    _load_pilot_script().main(argv)
+    script = _load_pilot_script()
+    # git이 없거나 .git 없이 받은 저장소에서도 테스트가 돌도록 커밋 조회는 바꿔 끼운다.
+    calls: list[dict] = []
+    script.resolve_code_commit = lambda repo_root, **kwargs: calls.append(kwargs) or COMMIT
+    script.main(argv)
+    assert calls == [{"allow_dirty": False}]
     return json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def system_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """진단 작업 폴더가 만들어지는 시스템 임시 폴더를 테스트 전용 폴더로 바꾼다."""
+    path = tmp_path / "system_tmp"
+    path.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(path))
+    return path
 
 
 def test_pilot_diagnosis_cli_records_command_line_q_while_unfixed(tmp_path: Path) -> None:
@@ -346,13 +362,12 @@ def test_pilot_diagnosis_cli_records_command_line_q_while_unfixed(tmp_path: Path
 
     assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 2
     # 공개 저장소에 커밋되는 파일이라 입력 경로는 남기지 않고, 코드 커밋으로 실행을 추적한다.
-    commit = settings.pop("commit")
-    assert len(commit) == 40 and all(char in "0123456789abcdef" for char in commit)
     assert settings == {
         "edge_top_q": 20.0,
         "edge_top_q_source": "command_line",
         "shave_border": 4,
         "datasets": ["Set5"],
+        "commit": COMMIT,
     }
 
 
@@ -375,31 +390,42 @@ def _run_pilot(sr_root: Path, hr_root: Path, out: Path, **overrides: object) -> 
     return run_pilot_diagnosis(sr_root, hr_root, out, _fair_comparison(None), **kwargs)  # type: ignore[arg-type]
 
 
-def test_pilot_rerun_replaces_only_diagnosis_outputs(tmp_path: Path) -> None:
+def _snapshot(directory: Path) -> dict[Path, bytes]:
+    return {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
+def test_pilot_rerun_replaces_only_diagnosis_outputs(tmp_path: Path, system_tmp: Path) -> None:
     """같은 폴더에 다시 돌리면 이전 진단 결과(오차 지도 포함)는 사라지고, 진단이 만들지 않은 파일은 남는다."""
     sr_root, hr_root, out = _write_pilot_pairs(tmp_path, count=3)
     _run_pilot(sr_root, hr_root, out)
     (out / ".gitkeep").write_text("", encoding="utf-8")
     (out / "pilot_train_settings.json").write_text('{"seed": 0}', encoding="utf-8")
-    assert len(list((out / "error_maps").glob("*.png"))) == 3
+    (out / "spectrum_pilot_train_loss.png").write_bytes(b"not a diagnosis output")
+    (out / "error_maps" / "notes.png").write_bytes(b"hand-picked")
+    assert len(list((out / "error_maps").glob("Set5_*.png"))) == 3
 
     for index in (1, 2):  # 두 번째 실행은 영상 1장만
         (hr_root / "Set5" / "HR" / f"img{index}.png").unlink()
     _run_pilot(sr_root, hr_root, out, edge_top_q=10.0)
 
-    assert [path.name for path in (out / "error_maps").glob("*.png")] == ["Set5_img0.png"]
+    assert sorted(path.name for path in (out / "error_maps").iterdir()) == ["Set5_img0.png", "notes.png"]
     assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 1
     assert json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))["edge_top_q"] == 10.0
     assert (out / ".gitkeep").is_file()
     assert (out / "pilot_train_settings.json").read_text(encoding="utf-8") == '{"seed": 0}'
-    assert not [path for path in tmp_path.iterdir() if path.name.startswith(".out")]  # 임시 폴더가 남지 않음
+    assert (out / "spectrum_pilot_train_loss.png").read_bytes() == b"not a diagnosis output"
+    # 작업 폴더는 출력 폴더 옆(results/ 안)이 아니라 시스템 임시 폴더에 만들고, 끝나면 지운다.
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["out", "sr", "system_tmp", "testsets"]
+    assert list(system_tmp.iterdir()) == []
 
 
-def test_pilot_failure_leaves_previous_outputs_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pilot_failure_leaves_previous_outputs_untouched(
+    tmp_path: Path, system_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """진단 도중 실패하면 이전 결과(CSV·그림·설정 기록)가 한 바이트도 바뀌지 않는다."""
     sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
     _run_pilot(sr_root, hr_root, out)
-    before = {path.relative_to(out): path.read_bytes() for path in out.rglob("*") if path.is_file()}
+    before = _snapshot(out)
 
     def broken_figures(*args: object, **kwargs: object) -> None:
         raise RuntimeError("그림 저장 실패")
@@ -408,9 +434,53 @@ def test_pilot_failure_leaves_previous_outputs_untouched(tmp_path: Path, monkeyp
     with pytest.raises(RuntimeError):
         _run_pilot(sr_root, hr_root, out, edge_top_q=10.0)
 
-    after = {path.relative_to(out): path.read_bytes() for path in out.rglob("*") if path.is_file()}
-    assert after == before
-    assert not [path for path in tmp_path.iterdir() if path.name.startswith(".out")]
+    assert _snapshot(out) == before
+    assert list(system_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "fails",
+    [
+        lambda src, dst: "staging" in Path(src).parts and Path(src).name == "summary_diagnosis.csv",
+        lambda src, dst: "backup" in Path(dst).parts and Path(src).name.startswith("Set5_"),
+    ],
+    ids=["moving_new_outputs_in", "moving_old_outputs_aside"],
+)
+def test_pilot_swap_failure_restores_previous_outputs(
+    tmp_path: Path, system_tmp: Path, monkeypatch: pytest.MonkeyPatch, fails
+) -> None:
+    """이전 결과를 치우거나 새 결과를 넣는 도중에 실패해도 이전 결과가 그대로 돌아온다."""
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+    _run_pilot(sr_root, hr_root, out)
+    before = _snapshot(out)
+    real_move = shutil.move
+
+    def flaky_move(src: str, dst: str, *args: object, **kwargs: object):
+        if fails(src, dst):
+            raise PermissionError("파일이 다른 프로그램에서 열려 있음")
+        return real_move(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "move", flaky_move)
+    with pytest.raises(PermissionError):
+        _run_pilot(sr_root, hr_root, out, edge_top_q=10.0)
+
+    assert _snapshot(out) == before
+    assert list(system_tmp.iterdir()) == []
+
+
+def test_pilot_rejects_empty_hr_folder(tmp_path: Path) -> None:
+    """설정에 있는 테스트셋의 HR 폴더가 비어 있으면(압축 해제 실패 등) 결과에서 조용히 빠지지 않고 멈춘다."""
+    sr_root, hr_root, out = tmp_path / "sr", tmp_path / "testsets", tmp_path / "out"
+    (hr_root / "Set5" / "HR").mkdir(parents=True)
+    with pytest.raises(ValueError):
+        _run_pilot(sr_root, hr_root, out)
+    assert not out.exists()
+
+
+def test_run_diagnosis_suite_processes_only_given_datasets(tmp_path: Path) -> None:
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path, datasets=("Set5", "Set14"))
+    run_diagnosis_suite(sr_root, hr_root, out, top_q_percent=20.0, shave_border=4, datasets=["Set5"])
+    assert set(pd.read_csv(out / "per_image_diagnosis.csv")["dataset"]) == {"Set5"}
 
 
 @pytest.mark.parametrize("hr_datasets", [(), ("Set5", "DIV2K_valid")])
