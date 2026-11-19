@@ -8,6 +8,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -250,14 +252,25 @@ def test_run_diagnosis_suite_requires_explicit_fair_comparison_values(tmp_path: 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _fair_comparison(edge_top_q: float | None, shave_border: int | None = 4) -> dict:
-    fixed_rules = {} if shave_border is None else {"shave_border": shave_border}
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _fair_comparison(
+    edge_top_q: float | None, shave_border: int | None = 4, datasets: object = ("Set5",)
+) -> dict:
+    fixed_rules: dict = {} if shave_border is None else {"shave_border": shave_border}
+    fixed_rules["datasets"] = list(datasets) if isinstance(datasets, tuple) else datasets
     return {"fixed_rules": fixed_rules, "pilot_determined": {"edge_top_q": edge_top_q}}
 
 
 def test_settings_use_fair_comparison_values_when_fixed() -> None:
     settings = resolve_diagnosis_settings(_fair_comparison(15.0, shave_border=6), edge_top_q=None)
-    assert settings == {"edge_top_q": 15.0, "edge_top_q_source": "fair_comparison", "shave_border": 6}
+    assert settings == {
+        "edge_top_q": 15.0,
+        "edge_top_q_source": "fair_comparison",
+        "shave_border": 6,
+        "datasets": ["Set5"],
+    }
 
 
 def test_settings_accept_matching_command_line_q_when_fixed() -> None:
@@ -272,7 +285,12 @@ def test_settings_require_command_line_q_while_unfixed() -> None:
 
 def test_settings_use_command_line_q_while_unfixed() -> None:
     settings = resolve_diagnosis_settings(_fair_comparison(None), edge_top_q=20.0)
-    assert settings == {"edge_top_q": 20.0, "edge_top_q_source": "command_line", "shave_border": 4}
+    assert settings == {
+        "edge_top_q": 20.0,
+        "edge_top_q_source": "command_line",
+        "shave_border": 4,
+        "datasets": ["Set5"],
+    }
 
 
 def test_settings_reject_command_line_q_different_from_fixed() -> None:
@@ -299,12 +317,15 @@ def _load_pilot_script():
     return module
 
 
-def _write_pilot_pairs(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _write_pilot_pairs(
+    tmp_path: Path, datasets: tuple[str, ...] = ("Set5",), count: int = 2
+) -> tuple[Path, Path, Path]:
     hr_root, sr_root, out = tmp_path / "testsets", tmp_path / "sr", tmp_path / "out"
-    for index in range(2):
-        hr = _rgb(40, 48, seed=index)
-        _write_png(hr_root / "Set5" / "HR" / f"img{index}.png", hr)
-        _write_png(sr_root / "Set5" / f"img{index}.png", _blur(hr, 3))
+    for dataset in datasets:
+        for index in range(count):
+            hr = _rgb(40, 48, seed=index)
+            _write_png(hr_root / dataset / "HR" / f"img{index}.png", hr)
+            _write_png(sr_root / dataset / f"img{index}.png", _blur(hr, 3))
     return sr_root, hr_root, out
 
 
@@ -313,9 +334,22 @@ def _run_pilot_cli(sr_root: Path, hr_root: Path, out: Path, config: Path, edge_t
     argv += ["--fair-comparison-config", str(config)]
     if edge_top_q is not None:
         argv += ["--edge-top-q", edge_top_q]
-    _load_pilot_script().main(argv)
-    assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 2
+    script = _load_pilot_script()
+    # git이 없거나 .git 없이 받은 저장소에서도 테스트가 돌도록 커밋 조회는 바꿔 끼운다.
+    calls: list[dict] = []
+    script.resolve_code_commit = lambda repo_root, **kwargs: calls.append(kwargs) or COMMIT
+    script.main(argv)
+    assert calls == [{"allow_dirty": False}]
     return json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def system_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """진단 작업 폴더가 만들어지는 시스템 임시 폴더를 테스트 전용 폴더로 바꾼다."""
+    path = tmp_path / "system_tmp"
+    path.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(path))
+    return path
 
 
 def test_pilot_diagnosis_cli_records_command_line_q_while_unfixed(tmp_path: Path) -> None:
@@ -326,8 +360,15 @@ def test_pilot_diagnosis_cli_records_command_line_q_while_unfixed(tmp_path: Path
 
     settings = _run_pilot_cli(sr_root, hr_root, out, config, edge_top_q="20")
 
-    # 공개 저장소에 커밋되는 파일이라 입력 경로는 남기지 않는다.
-    assert settings == {"edge_top_q": 20.0, "edge_top_q_source": "command_line", "shave_border": 4}
+    assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 2
+    # 공개 저장소에 커밋되는 파일이라 입력 경로는 남기지 않고, 코드 커밋으로 실행을 추적한다.
+    assert settings == {
+        "edge_top_q": 20.0,
+        "edge_top_q_source": "command_line",
+        "shave_border": 4,
+        "datasets": ["Set5"],
+        "commit": COMMIT,
+    }
 
 
 def test_pilot_diagnosis_cli_runs_with_repo_fair_comparison_config(tmp_path: Path) -> None:
@@ -335,16 +376,142 @@ def test_pilot_diagnosis_cli_runs_with_repo_fair_comparison_config(tmp_path: Pat
     config = REPO_ROOT / "configs" / "fair_comparison.yaml"
     fair_comparison = yaml.safe_load(config.read_text(encoding="utf-8"))
     unfixed = fair_comparison["pilot_determined"].get("edge_top_q") is None
-    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+    datasets = tuple(fair_comparison["fixed_rules"]["datasets"])
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path, datasets=datasets, count=1)
 
     settings = _run_pilot_cli(sr_root, hr_root, out, config, edge_top_q="20" if unfixed else None)
 
     assert settings["shave_border"] == fair_comparison["fixed_rules"]["shave_border"]
+    assert settings["datasets"] == list(datasets)
+
+
+def _run_pilot(sr_root: Path, hr_root: Path, out: Path, **overrides: object) -> dict:
+    kwargs = {"commit": COMMIT, "edge_top_q": 20.0, **overrides}
+    return run_pilot_diagnosis(sr_root, hr_root, out, _fair_comparison(None), **kwargs)  # type: ignore[arg-type]
+
+
+def _snapshot(directory: Path) -> dict[Path, bytes]:
+    return {path.relative_to(directory): path.read_bytes() for path in directory.rglob("*") if path.is_file()}
+
+
+def test_pilot_rerun_replaces_only_diagnosis_outputs(tmp_path: Path, system_tmp: Path) -> None:
+    """같은 폴더에 다시 돌리면 이전 진단 결과(오차 지도 포함)는 사라지고, 진단이 만들지 않은 파일은 남는다."""
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path, count=3)
+    _run_pilot(sr_root, hr_root, out)
+    (out / ".gitkeep").write_text("", encoding="utf-8")
+    (out / "pilot_train_settings.json").write_text('{"seed": 0}', encoding="utf-8")
+    (out / "spectrum_pilot_train_loss.png").write_bytes(b"not a diagnosis output")
+    (out / "error_maps" / "notes.png").write_bytes(b"hand-picked")
+    assert len(list((out / "error_maps").glob("Set5_*.png"))) == 3
+
+    for index in (1, 2):  # 두 번째 실행은 영상 1장만
+        (hr_root / "Set5" / "HR" / f"img{index}.png").unlink()
+    _run_pilot(sr_root, hr_root, out, edge_top_q=10.0)
+
+    assert sorted(path.name for path in (out / "error_maps").iterdir()) == ["Set5_img0.png", "notes.png"]
+    assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 1
+    assert json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))["edge_top_q"] == 10.0
+    assert (out / ".gitkeep").is_file()
+    assert (out / "pilot_train_settings.json").read_text(encoding="utf-8") == '{"seed": 0}'
+    assert (out / "spectrum_pilot_train_loss.png").read_bytes() == b"not a diagnosis output"
+    # 작업 폴더는 출력 폴더 옆(results/ 안)이 아니라 시스템 임시 폴더에 만들고, 끝나면 지운다.
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["out", "sr", "system_tmp", "testsets"]
+    assert list(system_tmp.iterdir()) == []
+
+
+def test_pilot_failure_leaves_previous_outputs_untouched(
+    tmp_path: Path, system_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """진단 도중 실패하면 이전 결과(CSV·그림·설정 기록)가 한 바이트도 바뀌지 않는다."""
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+    _run_pilot(sr_root, hr_root, out)
+    before = _snapshot(out)
+
+    def broken_figures(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("그림 저장 실패")
+
+    monkeypatch.setattr("sr_pipeline.diagnosis.diagnostics._save_figures", broken_figures)
+    with pytest.raises(RuntimeError):
+        _run_pilot(sr_root, hr_root, out, edge_top_q=10.0)
+
+    assert _snapshot(out) == before
+    assert list(system_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "fails",
+    [
+        lambda src, dst: "staging" in Path(src).parts and Path(src).name == "summary_diagnosis.csv",
+        lambda src, dst: "backup" in Path(dst).parts and Path(src).name.startswith("Set5_"),
+    ],
+    ids=["moving_new_outputs_in", "moving_old_outputs_aside"],
+)
+def test_pilot_swap_failure_restores_previous_outputs(
+    tmp_path: Path, system_tmp: Path, monkeypatch: pytest.MonkeyPatch, fails
+) -> None:
+    """이전 결과를 치우거나 새 결과를 넣는 도중에 실패해도 이전 결과가 그대로 돌아온다."""
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+    _run_pilot(sr_root, hr_root, out)
+    before = _snapshot(out)
+    real_move = shutil.move
+
+    def flaky_move(src: str, dst: str, *args: object, **kwargs: object):
+        if fails(src, dst):
+            raise PermissionError("파일이 다른 프로그램에서 열려 있음")
+        return real_move(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "move", flaky_move)
+    with pytest.raises(PermissionError):
+        _run_pilot(sr_root, hr_root, out, edge_top_q=10.0)
+
+    assert _snapshot(out) == before
+    assert list(system_tmp.iterdir()) == []
+
+
+def test_pilot_rejects_empty_hr_folder(tmp_path: Path) -> None:
+    """설정에 있는 테스트셋의 HR 폴더가 비어 있으면(압축 해제 실패 등) 결과에서 조용히 빠지지 않고 멈춘다."""
+    sr_root, hr_root, out = tmp_path / "sr", tmp_path / "testsets", tmp_path / "out"
+    (hr_root / "Set5" / "HR").mkdir(parents=True)
+    with pytest.raises(ValueError):
+        _run_pilot(sr_root, hr_root, out)
+    assert not out.exists()
+
+
+def test_run_diagnosis_suite_processes_only_given_datasets(tmp_path: Path) -> None:
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path, datasets=("Set5", "Set14"))
+    run_diagnosis_suite(sr_root, hr_root, out, top_q_percent=20.0, shave_border=4, datasets=["Set5"])
+    assert set(pd.read_csv(out / "per_image_diagnosis.csv")["dataset"]) == {"Set5"}
+
+
+@pytest.mark.parametrize("hr_datasets", [(), ("Set5", "DIV2K_valid")])
+def test_pilot_rejects_hr_datasets_different_from_fair_comparison(tmp_path: Path, hr_datasets: tuple[str, ...]) -> None:
+    """HR 폴더의 데이터셋이 fixed_rules.datasets와 다르면(빠짐·추가) 아무것도 쓰기 전에 멈춘다."""
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path, datasets=hr_datasets or ("Set14",))
+    with pytest.raises(ValueError):
+        _run_pilot(sr_root, hr_root, out)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("datasets", [[], ["Set5", "Set5"], ["Set5", 14], "Set5", None])
+def test_settings_reject_invalid_datasets(datasets: object) -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(None, datasets=datasets), edge_top_q=20.0)
+
+
+@pytest.mark.parametrize("commit", ["", "   ", None])
+def test_pilot_requires_commit(tmp_path: Path, commit: object) -> None:
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+    with pytest.raises(ValueError):
+        _run_pilot(sr_root, hr_root, out, commit=commit)
+    assert not out.exists()
 
 
 @pytest.mark.parametrize("shave_border", [None, True, 4.0, -1])
 def test_settings_reject_invalid_shave_border(shave_border: object) -> None:
-    fair_comparison = {"fixed_rules": {"shave_border": shave_border}, "pilot_determined": {"edge_top_q": None}}
+    fair_comparison = {
+        "fixed_rules": {"shave_border": shave_border, "datasets": ["Set5"]},
+        "pilot_determined": {"edge_top_q": None},
+    }
     with pytest.raises(ValueError):
         resolve_diagnosis_settings(fair_comparison, edge_top_q=20.0)
 
@@ -375,5 +542,7 @@ def test_settings_reject_malformed_config(fair_comparison: object) -> None:
 def test_pilot_diagnosis_writes_nothing_when_settings_invalid(tmp_path: Path) -> None:
     out = tmp_path / "out"
     with pytest.raises(ValueError):
-        run_pilot_diagnosis(tmp_path / "sr", tmp_path / "testsets", out, _fair_comparison(None), edge_top_q=None)
+        run_pilot_diagnosis(
+            tmp_path / "sr", tmp_path / "testsets", out, _fair_comparison(None), commit=COMMIT, edge_top_q=None
+        )
     assert not out.exists()
