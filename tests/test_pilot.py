@@ -1,6 +1,6 @@
-"""파일럿 베이스라인 학습·SR 출력 생성 바깥 동작 테스트 (SPEC.md US51, Task T2.5).
+"""파일럿 베이스라인 학습·SR 결과 생성 바깥 동작 테스트 (SPEC.md US51, Task T2.5).
 
-작은 합성 패치 풀·테스트셋만 쓰므로 로컬 CPU에서 돈다. 여기 쓰인 하이퍼파라미터 값은 테스트용이며,
+작은 합성 패치 풀·테스트셋만 쓰므로 로컬 CPU에서 돈다. 여기 쓰인 학습 설정 값은 테스트용이며,
 `pilot_determined`가 `null`인 동안 코드에는 기본값을 두지 않는다.
 """
 
@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 
 from sr_pipeline.diagnosis.diagnostics import run_pilot_diagnosis
-from sr_pipeline.engine.pilot import generate_sr_outputs, train_pilot_baseline
+from sr_pipeline.engine.pilot import generate_sr_results, train_pilot_baseline
 
 SCALE = 4
 PATCH_HR = 16
@@ -67,7 +67,7 @@ def test_train_same_seed_reproduces_losses_and_different_seed_differs(data_dir: 
     assert first["epoch_losses"] != other["epoch_losses"]
 
 
-def test_train_requires_hyperparameters_without_defaults(data_dir: Path, tmp_path: Path) -> None:
+def test_train_requires_training_settings_without_defaults(data_dir: Path, tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         train_pilot_baseline(data_dir, tmp_path / "x.pth", seed=0, device="cpu")  # type: ignore[call-arg]
 
@@ -76,7 +76,7 @@ def test_train_requires_hyperparameters_without_defaults(data_dir: Path, tmp_pat
     "override",
     [{"epochs": 0}, {"batch_size": 0}, {"patches_per_epoch": 0}, {"learning_rate": 0.0}, {"learning_rate": float("nan")}],
 )
-def test_train_rejects_invalid_hyperparameters_before_writing(
+def test_train_rejects_invalid_training_settings_before_writing(
     data_dir: Path, tmp_path: Path, override: dict
 ) -> None:
     checkpoint = tmp_path / "bad.pth"
@@ -99,13 +99,13 @@ def _write_testsets(data_dir: Path, names: tuple[str, ...], sizes: tuple[tuple[i
                 Image.fromarray(array).save(folder / f"img{index}.png")
 
 
-def test_generate_sr_outputs_writes_hr_sized_png_per_test_image(data_dir: Path, tmp_path: Path) -> None:
+def test_generate_sr_results_writes_hr_sized_png_per_test_image(data_dir: Path, tmp_path: Path) -> None:
     _write_testsets(data_dir, ("SetA", "SetB"), ((32, 48), (24, 24)))
     checkpoint = tmp_path / "pilot.pth"
     train_pilot_baseline(data_dir, checkpoint, **TRAIN_KWARGS)
     sr_dir = tmp_path / "sr"
 
-    generate_sr_outputs(checkpoint, data_dir / "testsets", sr_dir, ["SetA", "SetB"], device="cpu")
+    generate_sr_results(checkpoint, data_dir / "testsets", sr_dir, ["SetA", "SetB"], device="cpu")
 
     for name in ("SetA", "SetB"):
         for image_id in ("img0", "img1"):
@@ -116,24 +116,24 @@ def test_generate_sr_outputs_writes_hr_sized_png_per_test_image(data_dir: Path, 
                 assert sr.size == hr.size
 
 
-def test_generate_sr_outputs_rejects_missing_dataset_before_writing(data_dir: Path, tmp_path: Path) -> None:
+def test_generate_sr_results_rejects_missing_dataset_before_writing(data_dir: Path, tmp_path: Path) -> None:
     _write_testsets(data_dir, ("SetA",), ((16, 16),))
     checkpoint = tmp_path / "pilot.pth"
     train_pilot_baseline(data_dir, checkpoint, **TRAIN_KWARGS)
     sr_dir = tmp_path / "sr"
 
     with pytest.raises(ValueError):
-        generate_sr_outputs(checkpoint, data_dir / "testsets", sr_dir, ["SetA", "Missing"], device="cpu")
+        generate_sr_results(checkpoint, data_dir / "testsets", sr_dir, ["SetA", "Missing"], device="cpu")
 
     assert not sr_dir.exists()
 
 
 def test_train_to_pilot_diagnosis_end_to_end(data_dir: Path, tmp_path: Path) -> None:
-    """학습 → SR 출력 → 진단 4종이 이어져 `results/pilot/`에 들어갈 산출물이 만들어진다."""
+    """학습 → SR 결과 → 진단 4종이 이어져 `results/pilot/`에 들어갈 산출물이 만들어진다."""
     _write_testsets(data_dir, ("SetA",), ((32, 32), (40, 24)))
     checkpoint, sr_dir, output_dir = tmp_path / "pilot.pth", tmp_path / "sr", tmp_path / "pilot_out"
     train_pilot_baseline(data_dir, checkpoint, **TRAIN_KWARGS)
-    generate_sr_outputs(checkpoint, data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
+    generate_sr_results(checkpoint, data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
     fair_comparison = {"fixed_rules": {"shave_border": 4}, "pilot_determined": {"edge_top_q": None}}
 
     settings = run_pilot_diagnosis(
@@ -179,7 +179,7 @@ def test_cli_trains_writes_sr_outputs_and_settings_without_paths(data_dir: Path,
     assert str(tmp_path) not in settings_text  # Public 저장소에 커밋되므로 경로를 남기지 않는다.
 
 
-def test_cli_requires_hyperparameters(data_dir: Path, tmp_path: Path) -> None:
+def test_cli_requires_training_settings(data_dir: Path, tmp_path: Path) -> None:
     args = _cli_args(data_dir, tmp_path, tmp_path / "fair.yaml")
     args.remove("--epochs")
     args.remove("1")

@@ -1,10 +1,10 @@
-"""파일럿 베이스라인 1시드 학습 + SR 출력 생성 CLI 진입점 (SPEC.md / User Story 51, Task T2.5).
+"""파일럿 베이스라인 1시드 학습 + SR 결과 생성 CLI 진입점 (SPEC.md / User Story 51, Task T2.5).
 
 정식 파이프라인(T3.7)이 끝나기 전에 진단 입력을 만드는 파일럿 전용 스크립트다. 순서:
 1. `<data-dir>/patch_pool`로 베이스라인 ESPCN을 학습하고 체크포인트를 `--checkpoint-path`에 저장한다.
 2. `<data-dir>/testsets/<데이터셋>/LR`의 SR 결과를 `--sr-dir`에 만든다. 데이터셋 이름은 공정 비교 조건 파일의
    `fixed_rules.datasets`에서 읽는다.
-3. 쓴 학습 설정을 `--output-dir/pilot_train_settings.json`에 남긴다(입력·출력 경로는 기록하지 않는다).
+3. 쓴 학습 설정을 `--output-dir/pilot_train_settings.json`에 남긴다(입력·저장 경로는 기록하지 않는다).
 이어서 `scripts/run_pilot_diagnosis.py --sr-dir <sr-dir> --hr-dir <data-dir>/testsets`로 진단 4종을 돌린다.
 
 에폭·에폭당 패치·배치·학습률은 `pilot_determined`가 `null`인 동안 코드에 기본값을 두지 않고 모두 필수 인자다.
@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from sr_pipeline.engine.pilot import generate_sr_outputs, train_pilot_baseline
+from sr_pipeline.engine.pilot import generate_sr_results, train_pilot_baseline
 
 SETTINGS_FILENAME = "pilot_train_settings.json"
 
@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> None:
         learning_rate=args.learning_rate,
         device=args.device,
     )
-    counts = generate_sr_outputs(
+    counts = generate_sr_results(
         args.checkpoint_path, args.data_dir / "testsets", args.sr_dir, dataset_names, device=args.device
     )
     record["sr_image_counts"] = counts
@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     for key, value in record.items():
         print(f"{key}: {value}")
-    print(f"next: python scripts/run_pilot_diagnosis.py --sr-dir {args.sr_dir} --hr-dir {args.data_dir / 'testsets'}")
+    print("next: scripts/run_pilot_diagnosis.py (--sr-dir: SR 결과 폴더, --hr-dir: <data-dir>/testsets)")
 
 
 if __name__ == "__main__":
