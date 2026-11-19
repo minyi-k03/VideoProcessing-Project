@@ -3,19 +3,37 @@
 파일럿 SR 결과(`<sr-dir>/<데이터셋>/<image_id>.png`)와 HR 영상(`<hr-dir>/<데이터셋>/HR/<image_id>.png`)로
 오차 지도, 에지·평탄 PSNR(Y), 주파수 스펙트럼, YCbCr 채널별 오차와 테스트셋별 최악 영상 목록을 만든다.
 
-가장자리 잘라내기(`shave_border`)는 공정 비교 조건 파일의 `fixed_rules`에서만 읽는다.
+가장자리 잘라내기(`shave_border`)와 테스트셋 목록(`datasets`)은 공정 비교 조건 파일의 `fixed_rules`에서만
+읽는다. HR 영상 폴더의 테스트셋이 그 목록과 다르면 멈춘다.
 `edge_top_q`는 T4.2에서 확정되기 전이면 `--edge-top-q`로 넘겨야 하고, 확정 후에는 파일 값과 같아야 한다.
-쓴 값과 출처는 `<output-dir>/diagnosis_settings.json`에 남는다.
+쓴 값과 출처, 이 저장소의 현재 커밋은 `<output-dir>/diagnosis_settings.json`에 남는다.
+
+같은 `--output-dir`에 다시 실행하면 진단 산출물만 통째로 바뀐다(이전 오차 지도가 섞이지 않는다).
+파일럿 학습 설정 기록(`pilot_train_settings.json`) 등 진단이 만들지 않은 파일은 남는다.
 """
 
 from __future__ import annotations
 
 import argparse
+import subprocess
 from pathlib import Path
 
 import yaml
 
 from sr_pipeline.diagnosis.diagnostics import run_pilot_diagnosis
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def current_commit() -> str:
+    """이 저장소의 현재 커밋(HEAD)을 돌려줍니다. git 저장소가 아니면 멈춥니다."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"코드 커밋을 읽지 못했습니다(git 저장소에서 실행하세요): {error}") from error
+    return result.stdout.strip()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -49,6 +67,7 @@ def main(argv: list[str] | None = None) -> None:
         args.hr_dir,
         args.output_dir,
         fair_comparison,
+        commit=current_commit(),
         edge_top_q=args.edge_top_q,
     )
     for key, value in record.items():

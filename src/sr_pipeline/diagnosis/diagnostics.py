@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -328,6 +330,18 @@ def run_diagnosis_suite(
 # ---------------------------------------------------------------- 파일럿 진단 (T2.5)
 
 DIAGNOSIS_SETTINGS_FILENAME = "diagnosis_settings.json"
+# 진단이 만들고 다시 실행할 때 통째로 바꾸는 산출물(glob 패턴). 같은 폴더의 다른 파일
+# (예: 파일럿 학습 설정 기록, .gitkeep)은 건드리지 않는다.
+DIAGNOSIS_OUTPUT_PATTERNS = (
+    "per_image_diagnosis.csv",
+    "summary_diagnosis.csv",
+    "worst_images.csv",
+    "edge_flat_psnr.png",
+    "ycbcr_error_share.png",
+    "spectrum_*.png",
+    "error_maps",
+    DIAGNOSIS_SETTINGS_FILENAME,
+)
 
 
 def _require_mapping(value: Any, name: str) -> dict[str, Any]:
@@ -343,11 +357,11 @@ def _require_number(value: Any, name: str) -> float:
 
 
 def resolve_diagnosis_settings(fair_comparison: dict[str, Any], edge_top_q: float | None) -> dict[str, Any]:
-    """`fair_comparison.yaml` 내용과 명령줄 `edge_top_q`로 진단에 쓸 값을 정합니다.
+    """`fair_comparison.yaml` 내용과 호출자가 넘긴 `edge_top_q`로 진단에 쓸 값을 정합니다.
 
-    - `shave_border`는 `fixed_rules`에서만 읽는다(명령줄로 바꿀 수 없다).
-    - `pilot_determined.edge_top_q`가 있으면 그 값을 쓰고, 명령줄 값이 다르면 오류.
-    - 아직 `null`(T4.2 확정 전)이면 명령줄 값이 필요하다. 코드에 임의 기본값을 두지 않고,
+    - `shave_border`·`datasets`는 `fixed_rules`에서만 읽는다(호출자가 바꿀 수 없다).
+    - `pilot_determined.edge_top_q`가 있으면 그 값을 쓰고, 넘긴 `edge_top_q`가 다르면 오류.
+    - 아직 `null`(T4.2 확정 전)이면 `edge_top_q`를 넘겨야 한다. 코드에 임의 기본값을 두지 않고,
       파일럿에서 쓴 값과 출처를 결과에 남기기 위해서다.
     """
     fair_comparison = _require_mapping(fair_comparison, "fair_comparison.yaml")
@@ -358,25 +372,54 @@ def resolve_diagnosis_settings(fair_comparison: dict[str, Any], edge_top_q: floa
     if not isinstance(shave_border, int) or isinstance(shave_border, bool) or shave_border < 0:
         raise ValueError(f"fixed_rules.shave_border는 0 이상의 정수여야 합니다: {shave_border!r}")
 
+    datasets = fixed_rules.get("datasets")
+    if (
+        not isinstance(datasets, list)
+        or not datasets
+        or not all(isinstance(name, str) and name for name in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        raise ValueError(f"fixed_rules.datasets는 중복 없는 테스트셋 이름 목록이어야 합니다: {datasets!r}")
+
     configured_q = pilot_determined.get("edge_top_q")
     if configured_q is None:
         if edge_top_q is None:
             raise ValueError(
                 "fair_comparison.yaml의 pilot_determined.edge_top_q가 아직 null입니다(T4.2 확정 전). "
-                "파일럿에서 쓸 값을 --edge-top-q로 넘기세요."
+                "파일럿에서 쓸 edge_top_q 값을 넘기세요."
             )
-        top_q, source = _require_number(edge_top_q, "--edge-top-q"), "command_line"
+        top_q, source = _require_number(edge_top_q, "edge_top_q"), "command_line"
     else:
         configured_q = _require_number(configured_q, "pilot_determined.edge_top_q")
-        if edge_top_q is not None and _require_number(edge_top_q, "--edge-top-q") != configured_q:
+        if edge_top_q is not None and _require_number(edge_top_q, "edge_top_q") != configured_q:
             raise ValueError(
-                f"--edge-top-q {edge_top_q}가 fair_comparison.yaml의 edge_top_q {configured_q}와 다릅니다. "
-                "확정된 공정 비교 조건 값은 명령줄로 바꿀 수 없습니다."
+                f"edge_top_q {edge_top_q}가 fair_comparison.yaml의 edge_top_q {configured_q}와 다릅니다. "
+                "확정된 공정 비교 조건 값은 호출할 때 바꿀 수 없습니다."
             )
         top_q, source = configured_q, "fair_comparison"
     if not 0.0 < top_q < 100.0:
         raise ValueError(f"edge_top_q는 0과 100 사이여야 합니다: {top_q}")
-    return {"edge_top_q": top_q, "edge_top_q_source": source, "shave_border": shave_border}
+    return {"edge_top_q": top_q, "edge_top_q_source": source, "shave_border": shave_border, "datasets": list(datasets)}
+
+
+def _check_hr_datasets(hr_dir: Path, datasets: list[str]) -> None:
+    """HR 영상 폴더의 `<데이터셋>/HR` 목록이 공정 비교 조건의 테스트셋과 정확히 같은지 확인합니다."""
+    found = {path.name for path in Path(hr_dir).iterdir() if (path / "HR").is_dir()} if Path(hr_dir).is_dir() else set()
+    missing, extra = sorted(set(datasets) - found), sorted(found - set(datasets))
+    if missing or extra:
+        raise ValueError(
+            f"HR 영상 폴더의 테스트셋이 fixed_rules.datasets와 다릅니다. 없음: {missing}, 목록에 없는 폴더: {extra}"
+        )
+
+
+def _replace_diagnosis_outputs(staging_dir: Path, output_dir: Path) -> None:
+    """`output_dir`의 진단 산출물을 지우고 `staging_dir`에 만든 새 산출물로 바꿉니다."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for pattern in DIAGNOSIS_OUTPUT_PATTERNS:
+        for stale in output_dir.glob(pattern):
+            shutil.rmtree(stale) if stale.is_dir() else stale.unlink()
+    for fresh in staging_dir.iterdir():
+        shutil.move(str(fresh), str(output_dir / fresh.name))
 
 
 def run_pilot_diagnosis(
@@ -385,21 +428,39 @@ def run_pilot_diagnosis(
     output_dir: Path,
     fair_comparison: dict[str, Any],
     *,
+    commit: str,
     edge_top_q: float | None = None,
 ) -> dict[str, Any]:
     """파일럿 SR 결과로 진단 4종을 돌리고, 쓴 설정을 `diagnosis_settings.json`에 남깁니다 (US 51).
 
-    입력 폴더 구조와 산출물은 `run_diagnosis_suite`와 같다. 설정이 잘못되면 산출물을 만들기 전에 실패한다.
-    반환값은 기록한 설정이다. 결과가 Public 저장소에 커밋되므로 입력 경로는 기록하지 않는다.
+    입력 폴더 구조와 산출물은 `run_diagnosis_suite`와 같다. HR 영상 폴더의 테스트셋은
+    `fixed_rules.datasets`와 정확히 같아야 한다. `commit`은 이 진단을 실행한 코드 커밋이다.
+
+    산출물은 옆의 임시 폴더에 모두 만든 뒤 `output_dir`의 이전 진단 산출물과 통째로 바꾼다.
+    그래서 다시 실행해도 이전 오차 지도가 섞이지 않고, 도중에 실패하면 `output_dir`은 그대로다.
+    진단이 만들지 않은 파일(파일럿 학습 설정 기록, `.gitkeep` 등)은 남는다.
+    결과가 Public 저장소에 커밋되므로 입력 경로는 기록하지 않는다. 반환값은 기록한 설정이다.
     """
     settings = resolve_diagnosis_settings(fair_comparison, edge_top_q)
-    run_diagnosis_suite(
-        sr_dir,
-        hr_dir,
-        output_dir,
-        top_q_percent=settings["edge_top_q"],
-        shave_border=settings["shave_border"],
-    )
-    with (Path(output_dir) / DIAGNOSIS_SETTINGS_FILENAME).open("w", encoding="utf-8") as file:
-        json.dump(settings, file, ensure_ascii=False, indent=2)
+    if not isinstance(commit, str) or not commit.strip():
+        raise ValueError(f"commit은 이 진단을 실행한 코드 커밋이어야 합니다: {commit!r}")
+    _check_hr_datasets(Path(hr_dir), settings["datasets"])
+    settings["commit"] = commit.strip()
+
+    output_dir = Path(output_dir)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent))
+    try:
+        run_diagnosis_suite(
+            sr_dir,
+            hr_dir,
+            staging_dir,
+            top_q_percent=settings["edge_top_q"],
+            shave_border=settings["shave_border"],
+        )
+        with (staging_dir / DIAGNOSIS_SETTINGS_FILENAME).open("w", encoding="utf-8") as file:
+            json.dump(settings, file, ensure_ascii=False, indent=2)
+        _replace_diagnosis_outputs(staging_dir, output_dir)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
     return settings
