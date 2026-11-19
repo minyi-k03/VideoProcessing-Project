@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -31,7 +32,17 @@ from sr_pipeline.models.espcn import ESPCN
 SCALE = 4
 PATCH_HR = 16
 POOL_SIZE = 12
-TRAIN_KWARGS = dict(seed=0, epochs=2, patches_per_epoch=8, batch_size=4, learning_rate=1e-3, device="cpu")
+TRAIN_KWARGS = dict(
+    seed=0,
+    epochs=2,
+    patches_per_epoch=8,
+    batch_size=4,
+    learning_rate=1e-3,
+    optimizer="adam",
+    scheduler="none",
+    augmentation="rot90x4_hflip",
+    device="cpu",
+)
 
 
 def _write_pool(data_dir: Path, seed: int = 123) -> None:
@@ -64,7 +75,11 @@ def test_epoch_batches_keep_hr_lr_spatial_correspondence_under_augmentation() ->
     lr_pool = rng.integers(0, 256, (6, 4, 4, 3), dtype=np.uint8)
     hr_pool = _upscale_by_repeat(lr_pool)
 
-    batches = list(sample_epoch_batches(hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=40, batch_size=8))
+    batches = list(
+        sample_epoch_batches(
+            hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=40, batch_size=8, augmentation="rot90x4_hflip"
+        )
+    )
 
     for lr, hr in batches:
         np.testing.assert_array_equal(hr, _upscale_by_repeat(lr))
@@ -73,12 +88,33 @@ def test_epoch_batches_keep_hr_lr_spatial_correspondence_under_augmentation() ->
     assert augmented, "증강(회전·뒤집기)이 한 번도 적용되지 않았다"
 
 
+def test_epoch_batches_without_augmentation_keeps_original_patches() -> None:
+    rng = np.random.default_rng(1)
+    lr_pool = rng.integers(0, 256, (6, 4, 4, 3), dtype=np.uint8)
+    hr_pool = _upscale_by_repeat(lr_pool)
+
+    batches = list(
+        sample_epoch_batches(
+            hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=12, batch_size=4, augmentation="none"
+        )
+    )
+
+    originals = {patch.tobytes() for patch in lr_pool}
+    for lr, hr in batches:
+        np.testing.assert_array_equal(hr, _upscale_by_repeat(lr))
+        assert all(patch.tobytes() in originals for patch in lr)
+
+
 def test_epoch_batches_cover_pool_evenly_when_epoch_exceeds_pool() -> None:
     # 패치마다 단색(값 = 인덱스 × 10)이라 증강 후에도 어떤 패치인지 알 수 있다.
     lr_pool = np.stack([np.full((4, 4, 3), index * 10, dtype=np.uint8) for index in range(5)])
     hr_pool = _upscale_by_repeat(lr_pool)
 
-    batches = list(sample_epoch_batches(hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=13, batch_size=4))
+    batches = list(
+        sample_epoch_batches(
+            hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=13, batch_size=4, augmentation="rot90x4_hflip"
+        )
+    )
 
     assert [len(lr) for lr, _ in batches] == [4, 4, 4, 1]
     seen = np.concatenate([lr[:, 0, 0, 0] // 10 for lr, _ in batches])
@@ -98,7 +134,7 @@ def test_train_writes_checkpoint_and_finite_epoch_losses(data_dir: Path, tmp_pat
     assert len(record["epoch_losses"]) == 2
     assert all(math.isfinite(loss) for loss in record["epoch_losses"])
     assert record["train_minutes"] >= 0.0
-    # 파일럿에서 코드에 고정한 학습 조건도 기록에 남아야 진단 근거를 재현할 수 있다.
+    # 호출자가 넘긴 학습 조건도 기록에 남아야 진단 근거를 재현할 수 있다.
     assert (record["optimizer"], record["scheduler"], record["augmentation"]) == ("adam", "none", "rot90x4_hflip")
 
 
@@ -114,9 +150,14 @@ def test_train_same_seed_reproduces_losses_and_different_seed_differs(data_dir: 
     assert all(torch.equal(weights_a[key], weights_b[key]) for key in weights_a)
 
 
-def test_train_requires_training_settings_without_defaults(data_dir: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "omitted",
+    ["epochs", "patches_per_epoch", "batch_size", "learning_rate", "optimizer", "scheduler", "augmentation"],
+)
+def test_train_requires_training_settings_without_defaults(data_dir: Path, tmp_path: Path, omitted: str) -> None:
+    kwargs = {key: value for key, value in TRAIN_KWARGS.items() if key != omitted}
     with pytest.raises(TypeError):
-        train_pilot_baseline(data_dir, tmp_path / "x.pth", seed=0, device="cpu")  # type: ignore[call-arg]
+        train_pilot_baseline(data_dir, tmp_path / "x.pth", **kwargs)  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize(
@@ -128,6 +169,9 @@ def test_train_requires_training_settings_without_defaults(data_dir: Path, tmp_p
         {"patches_per_epoch": 0},
         {"learning_rate": 0.0},
         {"learning_rate": float("nan")},
+        {"optimizer": "sgd"},
+        {"scheduler": "cosine"},
+        {"augmentation": "unknown"},
         {"seed": -1},
     ],
 )
@@ -299,12 +343,14 @@ def _cli_args(data_dir: Path, tmp_path: Path, config: Path) -> list[str]:
         "--sr-dir", str(tmp_path / "sr"),
         "--output-dir", str(tmp_path / "out"),
         "--seed", "0", "--epochs", "1", "--patches-per-epoch", "8", "--batch-size", "4",
-        "--learning-rate", "0.001", "--device", "cpu",
+        "--learning-rate", "0.001", "--optimizer", "adam", "--scheduler", "none", "--augmentation", "rot90x4_hflip",
+        "--device", "cpu",
         "--fair-comparison-config", str(config),
     ]
 
 
-REPO_FAIR_COMPARISON = Path(__file__).resolve().parents[1] / "configs" / "fair_comparison.yaml"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_FAIR_COMPARISON = REPO_ROOT / "configs" / "fair_comparison.yaml"
 
 
 def test_cli_with_repo_fair_comparison_writes_sr_results_and_settings_without_paths(
@@ -314,6 +360,9 @@ def test_cli_with_repo_fair_comparison_writes_sr_results_and_settings_without_pa
     with REPO_FAIR_COMPARISON.open(encoding="utf-8") as file:
         dataset_names = tuple(yaml.safe_load(file)["fixed_rules"]["datasets"])
     _write_testsets(data_dir, dataset_names, ((16, 16),))
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
 
     _load_cli().main(_cli_args(data_dir, tmp_path, REPO_FAIR_COMPARISON))
 
@@ -321,7 +370,9 @@ def test_cli_with_repo_fair_comparison_writes_sr_results_and_settings_without_pa
         assert (tmp_path / "sr" / name / "img0.png").is_file()
     settings_text = (tmp_path / "out" / "pilot_train_settings.json").read_text(encoding="utf-8")
     settings = json.loads(settings_text)
+    assert settings["commit"] == expected_commit
     assert settings["patch_pool_id"] == "synthetic_pool"
+    assert (settings["optimizer"], settings["scheduler"], settings["augmentation"]) == ("adam", "none", "rot90x4_hflip")
     assert settings["sr_image_counts"] == {name: 1 for name in dataset_names}
     # Public 저장소에 커밋되고 노트북 출력에도 남으므로 경로를 기록·출력하지 않는다.
     stdout = capsys.readouterr().out
@@ -376,10 +427,11 @@ def test_cli_rejects_malformed_fair_comparison_before_training(data_dir: Path, t
     assert not (tmp_path / "ckpt" / "pilot.pth").exists()
 
 
-def test_cli_requires_training_settings(data_dir: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("flag", ["--epochs", "--optimizer", "--scheduler", "--augmentation"])
+def test_cli_requires_training_settings(data_dir: Path, tmp_path: Path, flag: str) -> None:
     args = _cli_args(data_dir, tmp_path, tmp_path / "fair.yaml")
-    args.remove("--epochs")
-    args.remove("1")
+    index = args.index(flag)
+    del args[index : index + 2]
 
     with pytest.raises(SystemExit):
         _load_cli().main(args)

@@ -5,16 +5,19 @@
 1. `<data-dir>/patch_pool`로 베이스라인 ESPCN을 학습하고 체크포인트를 `--checkpoint-path`에 저장한다.
 2. `<data-dir>/testsets/<데이터셋>/LR`의 SR 결과를 `--sr-dir`에 만든다. 데이터셋 이름은 공정 비교 조건 파일의
    `fixed_rules.datasets`에서 읽는다.
-3. 쓴 학습 설정을 `--output-dir/pilot_train_settings.json`에 남긴다(입력·저장 경로는 기록하지 않는다).
+3. 쓴 학습 설정과 실행 시점 커밋(`git rev-parse HEAD`)을 `--output-dir/pilot_train_settings.json`에 남긴다
+   (입력·저장 경로는 기록하지 않는다).
 이어서 `scripts/run_pilot_diagnosis.py --sr-dir <sr-dir> --hr-dir <data-dir>/testsets`로 진단 4종을 돌린다.
 
-에폭·에폭당 패치·배치·학습률은 `pilot_determined`가 `null`인 동안 코드에 기본값을 두지 않고 모두 필수 인자다.
+에폭·에폭당 패치·배치·학습률·옵티마이저·스케줄·증강은 `pilot_determined`가 `null`인 동안 코드에 기본값을 두지 않고
+모두 필수 인자다.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 import torch
@@ -27,7 +30,22 @@ from sr_pipeline.engine.pilot import (
     train_pilot_baseline,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_FILENAME = "pilot_train_settings.json"
+
+
+def _resolve_git_commit() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    commit = result.stdout.strip()
+    if not commit:
+        raise RuntimeError("git rev-parse HEAD가 빈 값을 반환했습니다.")
+    return commit
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -43,6 +61,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patches-per-epoch", type=int, required=True)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--learning-rate", type=float, required=True)
+    parser.add_argument("--optimizer", type=str, required=True)
+    parser.add_argument("--scheduler", type=str, required=True)
+    parser.add_argument("--augmentation", type=str, required=True)
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Training/inference device."
     )
@@ -63,6 +84,7 @@ def main(argv: list[str] | None = None) -> None:
     collect_testset_lr_images(testsets_dir, dataset_names)
     if args.sr_dir.exists():
         raise FileExistsError(f"--sr-dir {args.sr_dir}가 이미 있습니다. 지우거나 다른 경로를 쓰세요.")
+    commit = _resolve_git_commit()
 
     record = train_pilot_baseline(
         args.data_dir,
@@ -72,12 +94,15 @@ def main(argv: list[str] | None = None) -> None:
         patches_per_epoch=args.patches_per_epoch,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
+        optimizer=args.optimizer,
+        scheduler=args.scheduler,
+        augmentation=args.augmentation,
         device=args.device,
     )
     counts = generate_sr_results(
         args.checkpoint_path, testsets_dir, args.sr_dir, dataset_names, device=args.device
     )
-    record["sr_image_counts"] = counts
+    record = {"commit": commit, **record, "sr_image_counts": counts}
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / SETTINGS_FILENAME).write_text(
