@@ -1,0 +1,21 @@
+{
+  "seed": 0,
+  "epochs": 1,
+  "patches_per_epoch": 10000,
+  "batch_size": 16,
+  "learning_rate": 0.001,
+  "optimizer": "adam",
+  "scheduler": "none",
+  "augmentation": "rot90x4_hflip",
+  "patch_pool_id": "div2k_x4_p96_n10000_s42_e8bc539e",
+  "epoch_losses": [
+    0.05840150462090969
+  ],
+  "train_minutes": 0.09807804763333176,
+  "sr_image_counts": {
+    "Set5": 5,
+    "Set14": 14,
+    "BSD100": 100,
+    "Urban100": 100
+  }
+}
