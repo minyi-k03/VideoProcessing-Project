@@ -1,6 +1,6 @@
 """1주차 파일럿 베이스라인 진단 4종 CLI 진입점 (SPEC.md / User Story 51, Task T2.5).
 
-파일럿 SR 결과(`<sr-dir>/<데이터셋>/<image_id>.png`)와 테스트셋 HR(`<hr-dir>/<데이터셋>/HR/<image_id>.png`)로
+파일럿 SR 결과(`<sr-dir>/<데이터셋>/<image_id>.png`)와 HR 영상(`<hr-dir>/<데이터셋>/HR/<image_id>.png`)로
 오차 지도, 에지·평탄 PSNR(Y), 주파수 스펙트럼, YCbCr 채널별 오차와 테스트셋별 최악 영상 목록을 만든다.
 
 가장자리 잘라내기(`shave_border`)는 공정 비교 조건 파일의 `fixed_rules`에서만 읽는다.

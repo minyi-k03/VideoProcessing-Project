@@ -330,6 +330,18 @@ def run_diagnosis_suite(
 DIAGNOSIS_SETTINGS_FILENAME = "diagnosis_settings.json"
 
 
+def _require_mapping(value: Any, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name}은(는) 키-값 묶음이어야 합니다: {type(value).__name__}")
+    return value
+
+
+def _require_number(value: Any, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name}은(는) 숫자여야 합니다: {value!r}")
+    return float(value)
+
+
 def resolve_diagnosis_settings(fair_comparison: dict[str, Any], edge_top_q: float | None) -> dict[str, Any]:
     """`fair_comparison.yaml` 내용과 명령줄 `edge_top_q`로 진단에 쓸 값을 정합니다.
 
@@ -338,26 +350,30 @@ def resolve_diagnosis_settings(fair_comparison: dict[str, Any], edge_top_q: floa
     - 아직 `null`(T4.2 확정 전)이면 명령줄 값이 필요하다. 코드에 임의 기본값을 두지 않고,
       파일럿에서 쓴 값과 출처를 결과에 남기기 위해서다.
     """
-    fixed_rules = fair_comparison.get("fixed_rules") or {}
-    if "shave_border" not in fixed_rules:
-        raise ValueError("fair_comparison.yaml의 fixed_rules에 shave_border가 없습니다.")
-    shave_border = int(fixed_rules["shave_border"])
+    fair_comparison = _require_mapping(fair_comparison, "fair_comparison.yaml")
+    fixed_rules = _require_mapping(fair_comparison.get("fixed_rules"), "fixed_rules")
+    pilot_determined = _require_mapping(fair_comparison.get("pilot_determined", {}), "pilot_determined")
 
-    configured_q = (fair_comparison.get("pilot_determined") or {}).get("edge_top_q")
+    shave_border = fixed_rules.get("shave_border")
+    if not isinstance(shave_border, int) or isinstance(shave_border, bool) or shave_border < 0:
+        raise ValueError(f"fixed_rules.shave_border는 0 이상의 정수여야 합니다: {shave_border!r}")
+
+    configured_q = pilot_determined.get("edge_top_q")
     if configured_q is None:
         if edge_top_q is None:
             raise ValueError(
                 "fair_comparison.yaml의 pilot_determined.edge_top_q가 아직 null입니다(T4.2 확정 전). "
                 "파일럿에서 쓸 값을 --edge-top-q로 넘기세요."
             )
-        top_q, source = float(edge_top_q), "command_line"
+        top_q, source = _require_number(edge_top_q, "--edge-top-q"), "command_line"
     else:
-        if edge_top_q is not None and float(edge_top_q) != float(configured_q):
+        configured_q = _require_number(configured_q, "pilot_determined.edge_top_q")
+        if edge_top_q is not None and _require_number(edge_top_q, "--edge-top-q") != configured_q:
             raise ValueError(
                 f"--edge-top-q {edge_top_q}가 fair_comparison.yaml의 edge_top_q {configured_q}와 다릅니다. "
                 "확정된 공정 비교 조건 값은 명령줄로 바꿀 수 없습니다."
             )
-        top_q, source = float(configured_q), "fair_comparison"
+        top_q, source = configured_q, "fair_comparison"
     if not 0.0 < top_q < 100.0:
         raise ValueError(f"edge_top_q는 0과 100 사이여야 합니다: {top_q}")
     return {"edge_top_q": top_q, "edge_top_q_source": source, "shave_border": shave_border}
@@ -374,7 +390,7 @@ def run_pilot_diagnosis(
     """파일럿 SR 결과로 진단 4종을 돌리고, 쓴 설정을 `diagnosis_settings.json`에 남깁니다 (US 51).
 
     입력 폴더 구조와 산출물은 `run_diagnosis_suite`와 같다. 설정이 잘못되면 산출물을 만들기 전에 실패한다.
-    반환값은 기록한 설정이다.
+    반환값은 기록한 설정이다. 결과가 Public 저장소에 커밋되므로 입력 경로는 기록하지 않는다.
     """
     settings = resolve_diagnosis_settings(fair_comparison, edge_top_q)
     run_diagnosis_suite(
@@ -384,7 +400,6 @@ def run_pilot_diagnosis(
         top_q_percent=settings["edge_top_q"],
         shave_border=settings["shave_border"],
     )
-    record = {**settings, "sr_dir": str(sr_dir), "hr_dir": str(hr_dir)}
     with (Path(output_dir) / DIAGNOSIS_SETTINGS_FILENAME).open("w", encoding="utf-8") as file:
-        json.dump(record, file, ensure_ascii=False, indent=2)
-    return record
+        json.dump(settings, file, ensure_ascii=False, indent=2)
+    return settings

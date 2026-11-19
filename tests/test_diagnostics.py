@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
+import yaml
 from PIL import Image
 
 from sr_pipeline.common.color import rgb_to_y, rgb_to_ycbcr, ycbcr_to_rgb
@@ -298,28 +299,77 @@ def _load_pilot_script():
     return module
 
 
-def test_pilot_diagnosis_cli_reads_repo_config_and_records_settings(tmp_path: Path) -> None:
+def _write_pilot_pairs(tmp_path: Path) -> tuple[Path, Path, Path]:
     hr_root, sr_root, out = tmp_path / "testsets", tmp_path / "sr", tmp_path / "out"
     for index in range(2):
         hr = _rgb(40, 48, seed=index)
         _write_png(hr_root / "Set5" / "HR" / f"img{index}.png", hr)
         _write_png(sr_root / "Set5" / f"img{index}.png", _blur(hr, 3))
+    return sr_root, hr_root, out
 
-    _load_pilot_script().main(
-        [
-            "--sr-dir", str(sr_root),
-            "--hr-dir", str(hr_root),
-            "--output-dir", str(out),
-            "--edge-top-q", "20",
-            "--fair-comparison-config", str(REPO_ROOT / "configs" / "fair_comparison.yaml"),
-        ]
-    )
 
+def _run_pilot_cli(sr_root: Path, hr_root: Path, out: Path, config: Path, edge_top_q: str | None) -> dict:
+    argv = ["--sr-dir", str(sr_root), "--hr-dir", str(hr_root), "--output-dir", str(out)]
+    argv += ["--fair-comparison-config", str(config)]
+    if edge_top_q is not None:
+        argv += ["--edge-top-q", edge_top_q]
+    _load_pilot_script().main(argv)
     assert len(pd.read_csv(out / "per_image_diagnosis.csv")) == 2
-    settings = json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))
-    assert settings["edge_top_q"] == 20.0
-    assert settings["edge_top_q_source"] == "command_line"
-    assert settings["shave_border"] == 4  # configs/fair_comparison.yaml fixed_rules.shave_border
+    return json.loads((out / "diagnosis_settings.json").read_text(encoding="utf-8"))
+
+
+def test_pilot_diagnosis_cli_records_command_line_q_while_unfixed(tmp_path: Path) -> None:
+    """edge_top_q가 null인 설정 파일(테스트 안에서 만든 임시 YAML)로 CLI를 끝까지 실행한다."""
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+    config = tmp_path / "fair_comparison.yaml"
+    config.write_text(yaml.safe_dump(_fair_comparison(None)), encoding="utf-8")
+
+    settings = _run_pilot_cli(sr_root, hr_root, out, config, edge_top_q="20")
+
+    # 공개 저장소에 커밋되는 파일이라 입력 경로는 남기지 않는다.
+    assert settings == {"edge_top_q": 20.0, "edge_top_q_source": "command_line", "shave_border": 4}
+
+
+def test_pilot_diagnosis_cli_runs_with_repo_fair_comparison_config(tmp_path: Path) -> None:
+    """실제 configs/fair_comparison.yaml로 실행한다. edge_top_q 확정(T4.2) 전후 모두 통과해야 한다."""
+    config = REPO_ROOT / "configs" / "fair_comparison.yaml"
+    fair_comparison = yaml.safe_load(config.read_text(encoding="utf-8"))
+    unfixed = fair_comparison["pilot_determined"].get("edge_top_q") is None
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path)
+
+    settings = _run_pilot_cli(sr_root, hr_root, out, config, edge_top_q="20" if unfixed else None)
+
+    assert settings["shave_border"] == fair_comparison["fixed_rules"]["shave_border"]
+
+
+@pytest.mark.parametrize("shave_border", [None, True, 4.0, -1])
+def test_settings_reject_invalid_shave_border(shave_border: object) -> None:
+    fair_comparison = {"fixed_rules": {"shave_border": shave_border}, "pilot_determined": {"edge_top_q": None}}
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(fair_comparison, edge_top_q=20.0)
+
+
+def test_settings_reject_bool_command_line_q() -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(None), edge_top_q=True)  # type: ignore[arg-type]
+
+
+def test_settings_reject_bool_configured_q() -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(_fair_comparison(True), edge_top_q=None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "fair_comparison",
+    [
+        None,
+        {"fixed_rules": None, "pilot_determined": {"edge_top_q": None}},
+        {"fixed_rules": {"shave_border": 4}, "pilot_determined": []},
+    ],
+)
+def test_settings_reject_malformed_config(fair_comparison: object) -> None:
+    with pytest.raises(ValueError):
+        resolve_diagnosis_settings(fair_comparison, edge_top_q=20.0)  # type: ignore[arg-type]
 
 
 def test_pilot_diagnosis_writes_nothing_when_settings_invalid(tmp_path: Path) -> None:
