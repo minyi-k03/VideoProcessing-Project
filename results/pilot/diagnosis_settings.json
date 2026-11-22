@@ -1,5 +1,12 @@
 {
   "edge_top_q": 20.0,
   "edge_top_q_source": "command_line",
-  "shave_border": 4
+  "shave_border": 4,
+  "datasets": [
+    "Set5",
+    "Set14",
+    "BSD100",
+    "Urban100"
+  ],
+  "commit": "2a77adbb67dfca4a4068bebcd70171b9af8cd507"
 }

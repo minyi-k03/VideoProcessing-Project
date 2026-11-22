@@ -34,12 +34,14 @@ SYNTHETIC_PILOT_DETERMINED: dict[str, Any] = {
     "learning_rate": 1e-3,
     "optimizer": "adam",
     "scheduler": "none",
-    "augmentation": "flip_rot",
+    "augmentation": "rot90x4_hflip",
     "edge_loss_lambda": 0.1,
     "edge_top_q": 10,
     "representative_images": {
         "Set5": {"median": "a", "worst": "b"},
         "Set14": {"median": "c", "worst": "d"},
+        "BSD100": {"median": "e", "worst": "f"},
+        "Urban100": {"median": "g", "worst": "h"},
     },
 }
 
@@ -169,12 +171,29 @@ def test_fair_comparison_structure_errors(tmp_path: Path) -> None:
         "null fixed rule": lambda d: d["fixed_rules"].update(scale=None),
         "bad seeds": lambda d: d["fixed_rules"].update(seeds=[0, "1"]),
         "bool seed": lambda d: d["fixed_rules"].update(seeds=[True]),
+        "duplicate dataset": lambda d: d["fixed_rules"].update(datasets=["Set5", "Set5"]),
         "bad representative": lambda d: d["pilot_determined"]["representative_images"].update(Set5={"median": None}),
+        "missing representative dataset": lambda d: d["pilot_determined"]["representative_images"].pop("Urban100"),
+        "extra representative dataset": lambda d: d["pilot_determined"]["representative_images"].update(
+            DIV2K={"median": None, "worst": None}
+        ),
     }
     for name, mutate in cases.items():
         with pytest.raises(ValueError):
             load_fair_comparison(broken(mutate))
             pytest.fail(f"구조 오류가 거부되지 않았습니다: {name}")
+
+
+def test_reject_missing_representative_dataset_even_when_others_determined(tmp_path: Path) -> None:
+    """fixed_rules.datasets 중 하나라도 representative_images에서 빠지면 T4.2 확인을 통과할 수 없어야 합니다."""
+    partial = copy.deepcopy(SYNTHETIC_PILOT_DETERMINED)
+    del partial["representative_images"]["BSD100"]
+    del partial["representative_images"]["Urban100"]
+    fair = _synthetic_fair(tmp_path, partial)
+    with pytest.raises(ValueError, match="BSD100"):
+        load_fair_comparison(fair)
+    with pytest.raises(ValueError, match="Urban100"):
+        resolve_run_config(fair, REAL_EXPERIMENTS, "baseline", seed=0)
 
 
 def test_load_fair_comparison_missing_file(tmp_path: Path) -> None:
@@ -195,6 +214,7 @@ def test_resolved_configs_differ_only_by_switches_and_seed(tmp_path: Path) -> No
     assert len(resolved) == 30
 
     reference = resolved[0]
+    # bicubic 구성만 trainable=False이고 학습 구성은 모두 True이므로 trainable 차이를 허용한다.
     allowed_to_differ = {"config_id", "seed", "trainable", "switches"}
     for other in resolved[1:]:
         differing = {

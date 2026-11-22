@@ -134,12 +134,18 @@ def _validate_fair_comparison(data: dict[str, Any], path: Path) -> None:
     if not isinstance(seeds, list) or not seeds or not all(_is_int(seed) for seed in seeds):
         raise ValueError(f"fixed_rules.seeds는 비어 있지 않은 정수 목록이어야 합니다: {seeds!r}")
     datasets = data["fixed_rules"]["datasets"]
-    if not isinstance(datasets, list) or not datasets or not all(isinstance(name, str) and name for name in datasets):
-        raise ValueError(f"fixed_rules.datasets는 비어 있지 않은 문자열 목록이어야 합니다: {datasets!r}")
+    if (
+        not isinstance(datasets, list)
+        or not datasets
+        or not all(isinstance(name, str) and name for name in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        raise ValueError(f"fixed_rules.datasets는 중복 없는 비어 있지 않은 문자열 목록이어야 합니다: {datasets!r}")
 
     representative = data["pilot_determined"]["representative_images"]
     if not isinstance(representative, dict):
         raise ValueError(f"pilot_determined.representative_images는 매핑이어야 합니다: {representative!r}")
+    _check_keys(representative, frozenset(datasets), "pilot_determined.representative_images")
     for dataset, entry in representative.items():
         if not isinstance(entry, dict):
             raise ValueError(f"pilot_determined.representative_images.{dataset}는 매핑이어야 합니다: {entry!r}")
