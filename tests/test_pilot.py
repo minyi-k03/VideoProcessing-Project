@@ -18,14 +18,17 @@ import torch
 import yaml
 from PIL import Image
 
+from sr_pipeline.common.bicubic import bicubic_resize
 from sr_pipeline.common.seed import create_data_rng
 from sr_pipeline.diagnosis.diagnostics import run_pilot_diagnosis
 from sr_pipeline.engine.pilot import (
     collect_testset_lr_images,
+    generate_bicubic_sr_results,
     generate_sr_results,
     sample_epoch_batches,
     train_pilot_baseline,
 )
+from sr_pipeline.evaluation.postprocess import quantize_and_shave
 from sr_pipeline.models.espcn import ESPCN
 
 SCALE = 4
@@ -479,3 +482,103 @@ def test_cli_requires_training_settings(data_dir: Path, tmp_path: Path, flag: st
 
     with pytest.raises(SystemExit):
         _load_cli().main(args)
+
+
+def test_generate_bicubic_sr_results_matches_common_bicubic_and_postprocess(
+    data_dir: Path, tmp_path: Path
+) -> None:
+    """Bicubic 하한 SR 결과는 `common.bicubic.bicubic_resize(lr, 4.0)` + `quantize_and_shave(border=0)`와 같다."""
+    _write_testsets(data_dir, ("SetA",), ((32, 24),))
+    sr_dir = tmp_path / "bicubic_sr"
+
+    counts = generate_bicubic_sr_results(data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
+
+    assert counts == {"SetA": 1}
+    lr_img = np.array(Image.open(data_dir / "testsets" / "SetA" / "LR" / "img0.png").convert("RGB"), dtype=np.uint8)
+    lr_tensor = torch.from_numpy(lr_img[None]).permute(0, 3, 1, 2).to(dtype=torch.float32) / 255.0
+    expected = (
+        (quantize_and_shave(bicubic_resize(lr_tensor, float(SCALE)), border=0) * 255.0)
+        .round()
+        .to(torch.uint8)[0]
+        .permute(1, 2, 0)
+        .numpy()
+    )
+    actual = np.array(Image.open(sr_dir / "SetA" / "img0.png").convert("RGB"), dtype=np.uint8)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_generate_bicubic_sr_results_refuses_existing_sr_dir(data_dir: Path, tmp_path: Path) -> None:
+    _write_testsets(data_dir, ("SetA",), ((16, 16),))
+    sr_dir = tmp_path / "bicubic_sr"
+    sr_dir.mkdir()
+
+    with pytest.raises(FileExistsError):
+        generate_bicubic_sr_results(data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
+
+
+def test_bicubic_pilot_diagnosis_stays_isolated_under_subdir(data_dir: Path, tmp_path: Path) -> None:
+    """Bicubic 진단을 `pilot/bicubic/`에 써도 상위 `pilot/`의 파일럿 베이스라인 산출물과 섞이지 않는다."""
+    _write_testsets(data_dir, ("SetA",), ((32, 32), (40, 24)))
+    pilot_dir = tmp_path / "pilot"
+    pilot_dir.mkdir()
+    baseline_marker = pilot_dir / "summary_diagnosis.csv"
+    baseline_marker.write_text("baseline-marker\n", encoding="utf-8")
+
+    sr_dir = tmp_path / "bicubic_sr"
+    generate_bicubic_sr_results(data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
+    fair_comparison = {"fixed_rules": {"shave_border": 4, "datasets": ["SetA"]}, "pilot_determined": {"edge_top_q": None}}
+
+    bicubic_out = pilot_dir / "bicubic"
+    settings = run_pilot_diagnosis(
+        sr_dir, data_dir / "testsets", bicubic_out, fair_comparison, commit="test", edge_top_q=20.0
+    )
+
+    assert settings["shave_border"] == 4
+    assert baseline_marker.read_text(encoding="utf-8") == "baseline-marker\n"
+    for name in (
+        "per_image_diagnosis.csv",
+        "summary_diagnosis.csv",
+        "worst_images.csv",
+        "diagnosis_settings.json",
+        "edge_flat_psnr.png",
+        "ycbcr_error_share.png",
+        "spectrum_SetA.png",
+    ):
+        assert (bicubic_out / name).is_file()
+
+
+def _load_bicubic_cli():
+    path = REPO_ROOT / "scripts" / "generate_pilot_bicubic.py"
+    spec = importlib.util.spec_from_file_location("generate_pilot_bicubic", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_bicubic_cli_writes_sr_results_without_printing_paths(
+    data_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with REPO_FAIR_COMPARISON.open(encoding="utf-8") as file:
+        dataset_names = tuple(yaml.safe_load(file)["fixed_rules"]["datasets"])
+    _write_testsets(data_dir, dataset_names, ((16, 16),))
+    sr_dir = tmp_path / "bicubic_sr"
+
+    _load_bicubic_cli().main(
+        [
+            "--data-dir",
+            str(data_dir),
+            "--sr-dir",
+            str(sr_dir),
+            "--device",
+            "cpu",
+            "--fair-comparison-config",
+            str(REPO_FAIR_COMPARISON),
+        ]
+    )
+
+    for name in dataset_names:
+        assert (sr_dir / name / "img0.png").is_file()
+    stdout = capsys.readouterr().out
+    for path in (tmp_path, data_dir):
+        assert str(path) not in stdout
+

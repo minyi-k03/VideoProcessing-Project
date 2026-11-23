@@ -16,7 +16,7 @@ import math
 import shutil
 import tempfile
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sr_pipeline.common.bicubic import bicubic_resize
 from sr_pipeline.common.seed import create_data_rng, set_model_seed
 from sr_pipeline.evaluation.postprocess import quantize_and_shave
 from sr_pipeline.losses.sr_loss import SRLoss
@@ -242,6 +243,48 @@ def collect_testset_lr_images(testsets_dir: Path, dataset_names: Sequence[str]) 
     return images_by_dataset
 
 
+def _prepare_sr_generation(
+    testsets_dir: Path,
+    sr_dir: Path,
+    dataset_names: Sequence[str],
+) -> tuple[Path, dict[str, list[Path]]]:
+    """SR 결과 폴더가 비어 있는지와 테스트셋 LR 영상을 먼저 확인합니다."""
+    sr_dir = Path(sr_dir)
+    if sr_dir.exists():
+        raise FileExistsError(f"{sr_dir}가 이미 있습니다. 이전 SR 결과와 섞이지 않도록 지우거나 다른 경로를 쓰세요.")
+    return sr_dir, collect_testset_lr_images(testsets_dir, dataset_names)
+
+
+def _write_sr_images(
+    images_by_dataset: dict[str, list[Path]],
+    sr_dir: Path,
+    sr_fn: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    device: torch.device,
+) -> dict[str, int]:
+    """테스트셋 LR 영상을 `sr_fn`으로 변환해 `<sr_dir>/<데이터셋>/<image_id>.png`에 원자적으로 저장합니다."""
+    sr_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f"{sr_dir.name}.partial-", dir=sr_dir.parent))
+    counts: dict[str, int] = {}
+    try:
+        with torch.no_grad():
+            for name, images in images_by_dataset.items():
+                (staging / name).mkdir()
+                for path in images:
+                    with Image.open(path) as image:
+                        lr = _to_tensor(np.array(image.convert("RGB"), dtype=np.uint8)[None], device)
+                    sr = quantize_and_shave(sr_fn(lr), border=0)
+                    # quantize_and_shave가 이미 8비트 격자로 맞춘 값이라 여기서는 PNG 저장용 정수로만 바꾼다.
+                    sr_uint8 = (sr * 255.0).round().to(torch.uint8)[0].permute(1, 2, 0).cpu().numpy()
+                    Image.fromarray(sr_uint8).save(staging / name / path.name)
+                counts[name] = len(images)
+        staging.rename(sr_dir)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return counts
+
+
 def generate_sr_results(
     checkpoint_path: Path,
     testsets_dir: Path,
@@ -262,33 +305,34 @@ def generate_sr_results(
     Returns:
         데이터셋별로 만든 SR 결과 수.
     """
-    sr_dir = Path(sr_dir)
-    if sr_dir.exists():
-        raise FileExistsError(f"{sr_dir}가 이미 있습니다. 이전 SR 결과와 섞이지 않도록 지우거나 다른 경로를 쓰세요.")
-    images_by_dataset = collect_testset_lr_images(testsets_dir, dataset_names)
-
+    sr_dir, images_by_dataset = _prepare_sr_generation(testsets_dir, sr_dir, dataset_names)
     torch_device = torch.device(device)
     model = ESPCN().to(torch_device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=torch_device, weights_only=True))
     model.eval()
+    return _write_sr_images(images_by_dataset, sr_dir, model, device=torch_device)
 
-    sr_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f"{sr_dir.name}.partial-", dir=sr_dir.parent))
-    counts: dict[str, int] = {}
-    try:
-        with torch.no_grad():
-            for name, images in images_by_dataset.items():
-                (staging / name).mkdir()
-                for path in images:
-                    with Image.open(path) as image:
-                        lr = _to_tensor(np.array(image.convert("RGB"), dtype=np.uint8)[None], torch_device)
-                    sr = quantize_and_shave(model(lr), border=0)
-                    # quantize_and_shave가 이미 8비트 격자로 맞춘 값이라 여기서는 PNG 저장용 정수로만 바꾼다.
-                    sr_uint8 = (sr * 255.0).round().to(torch.uint8)[0].permute(1, 2, 0).cpu().numpy()
-                    Image.fromarray(sr_uint8).save(staging / name / path.name)
-                counts[name] = len(images)
-        staging.rename(sr_dir)
-    except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
-    return counts
+
+def generate_bicubic_sr_results(
+    testsets_dir: Path,
+    sr_dir: Path,
+    dataset_names: Sequence[str],
+    *,
+    device: str,
+) -> dict[str, int]:
+    """테스트셋 LR 영상을 공용 bicubic 보간(x4)으로 확대해 파일럿 진단용 SR 결과 PNG를 만듭니다.
+
+    모든 확대는 `common.bicubic.bicubic_resize(lr, float(SCALE))`만 쓰며,
+    저장 전에 `quantize_and_shave(border=0)`로 [0, 1] 자르기와 8비트 양자화만 한다.
+    가장자리 잘라내기는 진단 쪽(`shave_border`)이 한다.
+
+    Returns:
+        데이터셋별로 만든 SR 결과 수.
+    """
+    sr_dir, images_by_dataset = _prepare_sr_generation(testsets_dir, sr_dir, dataset_names)
+    return _write_sr_images(
+        images_by_dataset,
+        sr_dir,
+        lambda lr: bicubic_resize(lr, float(SCALE)),
+        device=torch.device(device),
+    )
