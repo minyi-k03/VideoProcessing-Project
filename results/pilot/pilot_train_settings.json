@@ -1,5 +1,5 @@
 {
-  "commit": "2a77adbb67dfca4a4068bebcd70171b9af8cd507",
+  "commit": "f7189d57086e6d22942b33dc93772b7dc5d93a49",
   "seed": 0,
   "epochs": 30,
   "patches_per_epoch": 10000,
@@ -41,7 +41,7 @@
     0.032907351848483084,
     0.03140474640876055
   ],
-  "train_minutes": 1.5264009601500068,
+  "train_minutes": 1.5652318831333332,
   "sr_image_counts": {
     "Set5": 5,
     "Set14": 14,
