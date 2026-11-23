@@ -547,6 +547,75 @@ def test_bicubic_pilot_diagnosis_stays_isolated_under_subdir(data_dir: Path, tmp
         assert (bicubic_out / name).is_file()
 
 
+def test_generate_bicubic_sr_results_quadruples_size_and_preserves_flat_image(tmp_path: Path) -> None:
+    """구현과 독립적인 성질: SR 결과 크기는 LR의 정확히 4배이고, 단색 평탄 LR은 같은 단색 SR로 나온다."""
+    lr_dir = tmp_path / "testsets" / "SetA" / "LR"
+    lr_dir.mkdir(parents=True)
+    color = np.array([37, 142, 210], dtype=np.uint8)
+    flat_lr = np.broadcast_to(color, (6, 8, 3)).copy()
+    Image.fromarray(flat_lr).save(lr_dir / "flat.png")
+
+    sr_dir = tmp_path / "bicubic_sr"
+    counts = generate_bicubic_sr_results(tmp_path / "testsets", sr_dir, ["SetA"], device="cpu")
+
+    assert counts == {"SetA": 1}
+    sr_img = np.array(Image.open(sr_dir / "SetA" / "flat.png").convert("RGB"), dtype=np.uint8)
+    assert sr_img.shape == (6 * SCALE, 8 * SCALE, 3)
+    np.testing.assert_array_equal(sr_img, np.broadcast_to(color, (6 * SCALE, 8 * SCALE, 3)))
+
+
+def test_generate_bicubic_sr_results_leaves_no_artifacts_on_midway_failure(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """두 번째 영상 처리 중 예외가 나면 `sr_dir`와 `.partial-*` 임시 폴더가 모두 남지 않는다."""
+    import sr_pipeline.engine.pilot as pilot_module
+
+    _write_testsets(data_dir, ("SetA",), ((16, 16), (16, 16)))
+    sr_dir = tmp_path / "bicubic_sr"
+    calls = 0
+    real_resize = pilot_module.bicubic_resize
+
+    def fail_on_second(img: torch.Tensor, scale: float, antialiasing: bool = True) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected midway failure")
+        return real_resize(img, scale, antialiasing=antialiasing)
+
+    monkeypatch.setattr(pilot_module, "bicubic_resize", fail_on_second)
+
+    with pytest.raises(RuntimeError, match="injected midway failure"):
+        generate_bicubic_sr_results(data_dir / "testsets", sr_dir, ["SetA"], device="cpu")
+
+    assert not sr_dir.exists()
+    assert list(tmp_path.glob(f"{sr_dir.name}.partial-*")) == []
+
+
+def test_generate_bicubic_sr_results_handles_odd_nonsquare_lr_sizes(tmp_path: Path) -> None:
+    """홀수 크기·비정사각 LR 영상도 가로·세로 각각 정확히 4배 크기의 SR 결과로 저장된다."""
+    lr_dir = tmp_path / "testsets" / "SetA" / "LR"
+    lr_dir.mkdir(parents=True)
+    rng = np.random.default_rng(7)
+    shapes = {"odd_wide.png": (5, 7), "odd_tall.png": (9, 3)}
+    for filename, (height, width) in shapes.items():
+        Image.fromarray(rng.integers(0, 256, (height, width, 3), dtype=np.uint8)).save(lr_dir / filename)
+
+    sr_dir = tmp_path / "bicubic_sr"
+    counts = generate_bicubic_sr_results(tmp_path / "testsets", sr_dir, ["SetA"], device="cpu")
+
+    assert counts == {"SetA": 2}
+    for filename, (height, width) in shapes.items():
+        with Image.open(sr_dir / "SetA" / filename) as sr_image:
+            assert sr_image.size == (width * SCALE, height * SCALE)
+
+
+def test_generate_bicubic_sr_results_raises_when_lr_dir_missing(tmp_path: Path) -> None:
+    (tmp_path / "testsets" / "SetA").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="LR 폴더"):
+        generate_bicubic_sr_results(tmp_path / "testsets", tmp_path / "bicubic_sr", ["SetA"], device="cpu")
+
+
 def _load_bicubic_cli():
     path = REPO_ROOT / "scripts" / "generate_pilot_bicubic.py"
     spec = importlib.util.spec_from_file_location("generate_pilot_bicubic", path)
@@ -578,7 +647,8 @@ def test_bicubic_cli_writes_sr_results_without_printing_paths(
 
     for name in dataset_names:
         assert (sr_dir / name / "img0.png").is_file()
-    stdout = capsys.readouterr().out
+    captured = capsys.readouterr()
     for path in (tmp_path, data_dir):
-        assert str(path) not in stdout
+        assert str(path) not in captured.out
+        assert str(path) not in captured.err
 

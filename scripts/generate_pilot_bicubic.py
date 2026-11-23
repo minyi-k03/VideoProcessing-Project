@@ -4,8 +4,9 @@
 `common.bicubic.bicubic_resize(lr, 4.0)`으로 확대하고 `quantize_and_shave(border=0)`로
 [0, 1] 자르기와 8비트 양자화만 거쳐 `--sr-dir/<데이터셋>/<image_id>.png`에 저장한다.
 
-이어서 `scripts/run_pilot_diagnosis.py --sr-dir <sr-dir> --hr-dir <data-dir>/testsets --output-dir results/pilot/bicubic --edge-top-q 20`
+이어서 `scripts/run_pilot_diagnosis.py --sr-dir <sr-dir> --hr-dir <data-dir>/testsets --output-dir results/pilot/bicubic --edge-top-q <값>`
 으로 파일럿 베이스라인(`results/pilot/`)과 분리된 폴더에 진단 4종을 남긴다.
+`configs/fair_comparison.yaml`의 `pilot_determined.edge_top_q`가 확정되기 전에는 `--edge-top-q`로 값을 넘겨야 한다.
 """
 
 from __future__ import annotations
