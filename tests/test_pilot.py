@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -328,11 +327,26 @@ def test_train_to_pilot_diagnosis_end_to_end(data_dir: Path, tmp_path: Path) -> 
     assert np.isfinite(per_image.drop(columns=["dataset", "image_id"]).to_numpy(dtype=float)).all()
 
 
-def _load_cli():
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _load_cli(commit=lambda **kwargs: COMMIT):
+    """CLI 모듈을 읽고 커밋 조회를 바꿔 끼운다(작업 트리가 dirty여도, git이 없어도 테스트가 돈다).
+
+    `commit`은 `resolve_code_commit`에 넘어온 키워드 인자를 받아 기록할 커밋 문자열을 돌려주거나 예외를 낸다.
+    넘어온 인자는 `module.commit_calls`에 쌓인다. 실제 git 동작은 `tests/test_provenance.py`가 검증한다.
+    """
     path = Path(__file__).resolve().parents[1] / "scripts" / "train_pilot_baseline.py"
     spec = importlib.util.spec_from_file_location("train_pilot_baseline", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    module.commit_calls = []
+
+    def resolve_code_commit(repo_root, **kwargs):
+        module.commit_calls.append(kwargs)
+        return commit(**kwargs)
+
+    module.resolve_code_commit = resolve_code_commit
     return module
 
 
@@ -360,17 +374,16 @@ def test_cli_with_repo_fair_comparison_writes_sr_results_and_settings_without_pa
     with REPO_FAIR_COMPARISON.open(encoding="utf-8") as file:
         dataset_names = tuple(yaml.safe_load(file)["fixed_rules"]["datasets"])
     _write_testsets(data_dir, dataset_names, ((16, 16),))
-    expected_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
-    ).stdout.strip()
+    cli = _load_cli()
 
-    _load_cli().main(_cli_args(data_dir, tmp_path, REPO_FAIR_COMPARISON))
+    cli.main(_cli_args(data_dir, tmp_path, REPO_FAIR_COMPARISON))
 
     for name in dataset_names:
         assert (tmp_path / "sr" / name / "img0.png").is_file()
     settings_text = (tmp_path / "out" / "pilot_train_settings.json").read_text(encoding="utf-8")
     settings = json.loads(settings_text)
-    assert settings["commit"] == expected_commit
+    assert settings["commit"] == COMMIT
+    assert cli.commit_calls == [{"allow_dirty": False}]
     assert settings["patch_pool_id"] == "synthetic_pool"
     assert (settings["optimizer"], settings["scheduler"], settings["augmentation"]) == ("adam", "none", "rot90x4_hflip")
     assert settings["sr_image_counts"] == {name: 1 for name in dataset_names}
@@ -385,6 +398,37 @@ def _write_config(tmp_path: Path, text: str) -> Path:
     config = tmp_path / "fair.yaml"
     config.write_text(text, encoding="utf-8")
     return config
+
+
+def test_cli_allow_dirty_is_passed_through_and_dirty_commit_is_recorded(data_dir: Path, tmp_path: Path) -> None:
+    _write_testsets(data_dir, ("SetA",), ((16, 16),))
+    config = _write_config(tmp_path, "fixed_rules:\n  datasets: [SetA]\n")
+    cli = _load_cli(commit=lambda allow_dirty: f"{COMMIT}-dirty" if allow_dirty else COMMIT)
+
+    cli.main([*_cli_args(data_dir, tmp_path, config), "--allow-dirty"])
+
+    assert cli.commit_calls == [{"allow_dirty": True}]
+    settings = json.loads((tmp_path / "out" / "pilot_train_settings.json").read_text(encoding="utf-8"))
+    assert settings["commit"] == f"{COMMIT}-dirty"
+
+
+def test_cli_stops_before_training_when_code_has_uncommitted_changes(data_dir: Path, tmp_path: Path) -> None:
+    _write_testsets(data_dir, ("SetA",), ((16, 16),))
+    config = _write_config(tmp_path, "fixed_rules:\n  datasets: [SetA]\n")
+
+    def refuse(allow_dirty: bool) -> str:
+        raise RuntimeError("코드·설정에 커밋되지 않은 변경이 있어")
+
+    cli = _load_cli(commit=refuse)
+
+    with pytest.raises(SystemExit, match="학습을 시작하지 않았습니다"):
+        cli.main(_cli_args(data_dir, tmp_path, config))
+
+    assert cli.commit_calls == [{"allow_dirty": False}]
+    # 긴 학습 전에 멈춰야 하므로 체크포인트·SR 결과·학습 설정 기록이 하나도 없다.
+    assert not (tmp_path / "ckpt").exists()
+    assert not (tmp_path / "sr").exists()
+    assert not (tmp_path / "out").exists()
 
 
 def test_cli_checks_testsets_before_training(data_dir: Path, tmp_path: Path) -> None:
