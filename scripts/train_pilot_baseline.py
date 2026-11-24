@@ -1,0 +1,112 @@
+"""파일럿 베이스라인 1시드 학습 + SR 결과 생성 CLI 진입점 (SPEC.md / User Story 51, Task T2.5).
+
+정식 파이프라인(T3.7)이 끝나기 전에 진단 입력을 만드는 파일럿 전용 스크립트다. 순서:
+0. 학습 전에 설정 파일 구조, 테스트셋 LR 폴더, `--sr-dir`가 아직 없는지 확인한다(긴 학습 뒤 실패하지 않게).
+1. `<data-dir>/patch_pool`로 베이스라인 ESPCN을 학습하고 체크포인트를 `--checkpoint-path`에 저장한다.
+2. `<data-dir>/testsets/<데이터셋>/LR`의 SR 결과를 `--sr-dir`에 만든다. 데이터셋 이름은 공정 비교 조건 파일의
+   `fixed_rules.datasets`에서 읽는다.
+3. 쓴 학습 설정과 실행 시점 커밋을 `--output-dir/pilot_train_settings.json`에 남긴다(입력·저장 경로는 기록하지 않는다).
+   `src/`·`scripts/`·`configs/`에 커밋되지 않은 변경이 있으면 학습을 시작하지 않고 멈춘다
+   (`--allow-dirty`면 커밋 뒤에 `-dirty`를 붙여 기록).
+이어서 `scripts/run_pilot_diagnosis.py --sr-dir <sr-dir> --hr-dir <data-dir>/testsets`로 진단 4종을 돌린다.
+
+에폭·에폭당 패치·배치·학습률·옵티마이저·스케줄·증강은 `pilot_determined`가 `null`인 동안 코드에 기본값을 두지 않고
+모두 필수 인자다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import torch
+import yaml
+
+from sr_pipeline.diagnosis.provenance import resolve_code_commit
+from sr_pipeline.engine.pilot import (
+    collect_testset_lr_images,
+    generate_sr_results,
+    resolve_testset_names,
+    train_pilot_baseline,
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SETTINGS_FILENAME = "pilot_train_settings.json"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the pilot baseline (1 seed) and write SR results for diagnosis.")
+    parser.add_argument("--data-dir", type=Path, required=True, help="Prepared data root (patch_pool/, testsets/).")
+    parser.add_argument("--checkpoint-path", type=Path, required=True, help="Checkpoint file to write (keep on Drive).")
+    parser.add_argument("--sr-dir", type=Path, required=True, help="Where to write SR results (<dataset>/<image_id>.png); must not exist yet.")
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("results/pilot"), help="Where to write pilot_train_settings.json."
+    )
+    parser.add_argument("--seed", type=int, required=True, help="Pilot seed (one seed only).")
+    parser.add_argument("--epochs", type=int, required=True)
+    parser.add_argument("--patches-per-epoch", type=int, required=True)
+    parser.add_argument("--batch-size", type=int, required=True)
+    parser.add_argument("--learning-rate", type=float, required=True)
+    parser.add_argument("--optimizer", type=str, required=True)
+    parser.add_argument("--scheduler", type=str, required=True)
+    parser.add_argument("--augmentation", type=str, required=True)
+    parser.add_argument(
+        "--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Training/inference device."
+    )
+    parser.add_argument(
+        "--fair-comparison-config",
+        type=Path,
+        default=Path("configs/fair_comparison.yaml"),
+        help="Fair comparison conditions file (source of testset names).",
+    )
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Run even with uncommitted changes in src/scripts/configs (recorded commit gets a -dirty suffix).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    with args.fair_comparison_config.open(encoding="utf-8") as file:
+        dataset_names = resolve_testset_names(yaml.safe_load(file))
+    testsets_dir = args.data_dir / "testsets"
+    collect_testset_lr_images(testsets_dir, dataset_names)
+    if args.sr_dir.exists():
+        raise FileExistsError(f"--sr-dir {args.sr_dir}가 이미 있습니다. 지우거나 다른 경로를 쓰세요.")
+    try:
+        commit = resolve_code_commit(REPO_ROOT, allow_dirty=args.allow_dirty)
+    except RuntimeError as error:
+        raise SystemExit(f"학습을 시작하지 않았습니다: {error}") from error
+
+    record = train_pilot_baseline(
+        args.data_dir,
+        args.checkpoint_path,
+        seed=args.seed,
+        epochs=args.epochs,
+        patches_per_epoch=args.patches_per_epoch,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        optimizer=args.optimizer,
+        scheduler=args.scheduler,
+        augmentation=args.augmentation,
+        device=args.device,
+    )
+    counts = generate_sr_results(
+        args.checkpoint_path, testsets_dir, args.sr_dir, dataset_names, device=args.device
+    )
+    record = {"commit": commit, **record, "sr_image_counts": counts}
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / SETTINGS_FILENAME).write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    for key, value in record.items():
+        print(f"{key}: {value}")
+    print("next: scripts/run_pilot_diagnosis.py (--sr-dir: SR 결과 폴더, --hr-dir: <data-dir>/testsets)")
+
+
+if __name__ == "__main__":
+    main()
