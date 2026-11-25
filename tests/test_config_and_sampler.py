@@ -18,6 +18,9 @@ from sr_pipeline.config.schema import (
     load_fair_comparison,
     resolve_run_config,
 )
+from sr_pipeline.common.seed import set_model_seed
+from sr_pipeline.data.sampler import SeededEpochPatchSampler
+from sr_pipeline.models.espcn import ESPCN
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_FAIR = REPO_ROOT / "configs" / "fair_comparison.yaml"
@@ -264,11 +267,52 @@ def test_resolved_configs_do_not_share_mutable_state(tmp_path: Path) -> None:
     assert second.fair_comparison["pilot_determined"]["epochs"] == 1
 
 
-@pytest.mark.skip(reason="Skeleton test: implement alongside data.sampler")
-def test_sampler_same_order_for_same_seed_across_configs() -> None:
-    """같은 시드면 구성이 달라도 샘플러가 동일한 패치 순서를 생성해야 합니다."""
+def _sampler_for(run: Any) -> SeededEpochPatchSampler:
+    """확정된 실행 조건의 공정 비교 값만으로 샘플러를 만든다(트레이너가 쓰는 방식)."""
+    determined = run.fair_comparison["pilot_determined"]
+    return SeededEpochPatchSampler(
+        determined["patch_pool_size"],
+        determined["patches_per_epoch"],
+        run.seed,
+        augmentation=determined["augmentation"],
+    )
 
 
-@pytest.mark.skip(reason="Skeleton test: implement alongside data.sampler")
-def test_sampler_different_order_for_different_seeds() -> None:
+def _plans(sampler: SeededEpochPatchSampler, epochs: int = 3) -> list[tuple[list[int], list[int]]]:
+    return [tuple(part.tolist() for part in sampler.epoch_plan(epoch)) for epoch in range(epochs)]
+
+
+# ---- 샘플러: 시드가 순서를 정한다 (US32) ----
+
+
+def _plans_after_model_init(run: Any) -> list[tuple[list[int], list[int]]]:
+    """트레이너 순서(샘플러 생성 → 모델 시드 고정·구성별 모델 초기화 → 에폭 계획)대로 계획을 뽑는다.
+
+    스위치 B·C는 모델 파라미터 수를 바꾸므로 구성마다 모델 초기화가 소비하는 난수 양이 다르다(03-plan의 스위치 대응).
+    """
+    sampler = _sampler_for(run)
+    set_model_seed(run.seed)
+    ESPCN(use_y_channel=run.switches.B, use_global_residual=run.switches.C)
+    return _plans(sampler)
+
+
+@pytest.mark.usefixtures("restore_global_random_state")
+def test_sampler_same_order_for_same_seed_across_configs(tmp_path: Path) -> None:
+    """같은 시드면 구성이 달라도(모델 초기화 난수 소비량이 달라도) 샘플러가 동일한 패치 순서를 생성해야 합니다."""
+    fair = _synthetic_fair(tmp_path)
+    config_ids = [config_id for config_id in yaml.safe_load(REAL_EXPERIMENTS.read_text(encoding="utf-8"))["configs"] if config_id != "bicubic"]
+    runs = [resolve_run_config(fair, REAL_EXPERIMENTS, config_id, seed=0) for config_id in config_ids]
+    # 모델 난수 소비량이 다른 구성이 실제로 섞여 있어야 이 테스트가 의미가 있다.
+    assert {(run.switches.B, run.switches.C) for run in runs} >= {(False, False), (True, False), (False, True)}
+
+    for seed in (0, 1, 2):
+        plans = {config_id: _plans_after_model_init(resolve_run_config(fair, REAL_EXPERIMENTS, config_id, seed=seed))
+                 for config_id in config_ids}
+        assert all(plan == plans["baseline"] for plan in plans.values()), f"seed {seed}에서 구성별 순서가 다르다"
+
+
+def test_sampler_different_order_for_different_seeds(tmp_path: Path) -> None:
     """시드가 다르면 다른 패치 순서를 생성해야 합니다."""
+    fair = _synthetic_fair(tmp_path)
+    plans = [_plans(_sampler_for(resolve_run_config(fair, REAL_EXPERIMENTS, "baseline", seed=seed))) for seed in (0, 1, 2)]
+    assert plans[0] != plans[1] and plans[0] != plans[2] and plans[1] != plans[2]
