@@ -18,7 +18,9 @@ from sr_pipeline.config.schema import (
     load_fair_comparison,
     resolve_run_config,
 )
+from sr_pipeline.common.seed import set_model_seed
 from sr_pipeline.data.sampler import SeededEpochPatchSampler
+from sr_pipeline.models.espcn import ESPCN
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_FAIR = REPO_ROOT / "configs" / "fair_comparison.yaml"
@@ -283,14 +285,28 @@ def _plans(sampler: SeededEpochPatchSampler, epochs: int = 3) -> list[tuple[list
 # ---- 샘플러: 시드가 순서를 정한다 (US32) ----
 
 
+def _plans_after_model_init(run: Any) -> list[tuple[list[int], list[int]]]:
+    """트레이너 순서(샘플러 생성 → 모델 시드 고정·구성별 모델 초기화 → 에폭 계획)대로 계획을 뽑는다.
+
+    스위치 B·C는 모델 파라미터 수를 바꾸므로 구성마다 모델 초기화가 소비하는 난수 양이 다르다(03-plan의 스위치 대응).
+    """
+    sampler = _sampler_for(run)
+    set_model_seed(run.seed)
+    ESPCN(use_y_channel=run.switches.B, use_global_residual=run.switches.C)
+    return _plans(sampler)
+
+
+@pytest.mark.usefixtures("restore_global_random_state")
 def test_sampler_same_order_for_same_seed_across_configs(tmp_path: Path) -> None:
-    """같은 시드면 구성이 달라도 샘플러가 동일한 패치 순서를 생성해야 합니다."""
+    """같은 시드면 구성이 달라도(모델 초기화 난수 소비량이 달라도) 샘플러가 동일한 패치 순서를 생성해야 합니다."""
     fair = _synthetic_fair(tmp_path)
     config_ids = [config_id for config_id in yaml.safe_load(REAL_EXPERIMENTS.read_text(encoding="utf-8"))["configs"] if config_id != "bicubic"]
-    assert len(config_ids) > 1
+    runs = [resolve_run_config(fair, REAL_EXPERIMENTS, config_id, seed=0) for config_id in config_ids]
+    # 모델 난수 소비량이 다른 구성이 실제로 섞여 있어야 이 테스트가 의미가 있다.
+    assert {(run.switches.B, run.switches.C) for run in runs} >= {(False, False), (True, False), (False, True)}
 
     for seed in (0, 1, 2):
-        plans = {config_id: _plans(_sampler_for(resolve_run_config(fair, REAL_EXPERIMENTS, config_id, seed=seed)))
+        plans = {config_id: _plans_after_model_init(resolve_run_config(fair, REAL_EXPERIMENTS, config_id, seed=seed))
                  for config_id in config_ids}
         assert all(plan == plans["baseline"] for plan in plans.values()), f"seed {seed}에서 구성별 순서가 다르다"
 

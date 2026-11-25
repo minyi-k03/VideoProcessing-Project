@@ -11,28 +11,36 @@ import numpy as np
 
 from sr_pipeline.data.prepare import METADATA_FILENAME, POOL_DIRNAME
 from sr_pipeline.data.sampler import SeededEpochPatchSampler, augment_patch
-from sr_pipeline.models.espcn import SCALE
+
+
+def _read_pool_metadata(data_dir: Path) -> dict[str, Any]:
+    return json.loads((Path(data_dir) / POOL_DIRNAME / METADATA_FILENAME).read_text(encoding="utf-8"))
 
 
 def read_patch_pool_id(data_dir: Path) -> str:
     """`<data_dir>/patch_pool/metadata.json`의 `patch_pool_id`를 읽습니다(큰 배열은 읽지 않는다)."""
-    metadata = json.loads((Path(data_dir) / POOL_DIRNAME / METADATA_FILENAME).read_text(encoding="utf-8"))
-    return str(metadata["patch_pool_id"])
+    return str(_read_pool_metadata(data_dir)["patch_pool_id"])
 
 
 class PatchPoolDataset:
-    """공유 패치 풀과 SeededEpochPatchSampler를 연결하는 학습 데이터셋.
+    """공유 패치 풀과 SeededEpochPatchSampler를 연결하는 패치 풀 데이터셋.
 
     풀은 `<data_dir>/patch_pool/{hr.npy, lr.npy, metadata.json}`(`data.prepare.create_patch_pool`의 산출물)이며,
-    HR·LR 패치는 uint8 `(N, H, W, 3)` 배열로 메모리에 올린다.
+    HR·LR 패치는 uint8 `(N, H, W, 3)` 배열로 메모리에 올린다. 배율(`scale`)은 풀 메타데이터의 값을 쓰며,
+    모델 배율과 맞는지는 호출자가 확인한다.
     """
 
     def __init__(self, data_dir: Path, patch_pool_id: str) -> None:
         self.data_dir = data_dir
-        found_id = read_patch_pool_id(data_dir)
+        metadata = _read_pool_metadata(data_dir)
+        found_id = str(metadata["patch_pool_id"])
         if found_id != patch_pool_id:
             raise ValueError(f"patch_pool_id가 다릅니다: 요청 {patch_pool_id!r}, 데이터 {found_id!r} ({data_dir})")
         self.patch_pool_id = found_id
+        scale = metadata.get("scale")
+        if isinstance(scale, bool) or not isinstance(scale, int) or scale < 1:
+            raise ValueError(f"패치 풀 metadata.json의 scale은 1 이상의 정수여야 합니다: {scale!r} ({data_dir})")
+        self.scale = scale
         pool_dir = Path(data_dir) / POOL_DIRNAME
         hr = np.load(pool_dir / "hr.npy")
         lr = np.load(pool_dir / "lr.npy")
@@ -42,8 +50,8 @@ class PatchPoolDataset:
             raise ValueError(f"패치 풀의 HR·LR 개수가 다릅니다: {hr.shape[0]} vs {lr.shape[0]}")
         if hr.shape[0] == 0:
             raise ValueError("패치 풀이 비어 있습니다.")
-        if hr.shape[1:3] != (lr.shape[1] * SCALE, lr.shape[2] * SCALE):
-            raise ValueError(f"HR 패치 크기가 LR의 x{SCALE}가 아닙니다: HR {hr.shape[1:3]}, LR {lr.shape[1:3]}")
+        if hr.shape[1:3] != (lr.shape[1] * scale, lr.shape[2] * scale):
+            raise ValueError(f"HR 패치 크기가 LR의 x{scale}가 아닙니다: HR {hr.shape[1:3]}, LR {lr.shape[1:3]}")
         self._hr = hr
         self._lr = lr
 

@@ -13,7 +13,9 @@ import numpy as np
 import pytest
 
 from sr_pipeline.data.dataset import PatchPoolDataset, read_patch_pool_id
-from sr_pipeline.data.sampler import SeededEpochPatchSampler
+from sr_pipeline.data.sampler import SeededEpochPatchSampler, augment_patch
+
+pytestmark = pytest.mark.usefixtures("restore_global_random_state")
 
 SCALE = 4
 POOL_SIZE = 12
@@ -26,13 +28,15 @@ def _upscale_by_repeat(lr: np.ndarray) -> np.ndarray:
     return np.repeat(np.repeat(lr, SCALE, axis=-3), SCALE, axis=-2)
 
 
-def _write_pool(data_dir: Path, lr: np.ndarray, hr: np.ndarray, pool_id: str = POOL_ID) -> None:
-    """`data.prepare.create_patch_pool`과 같은 파일 구조의 작은 합성 패치 풀을 쓴다."""
+def _write_pool(data_dir: Path, lr: np.ndarray, hr: np.ndarray, pool_id: str = POOL_ID, scale=SCALE) -> None:
+    """`data.prepare.create_patch_pool`과 같은 파일 구조의 작은 합성 패치 풀을 쓴다(`scale=None`이면 키를 뺀다)."""
     pool_dir = data_dir / "patch_pool"
     pool_dir.mkdir(parents=True)
     np.save(pool_dir / "hr.npy", hr)
     np.save(pool_dir / "lr.npy", lr)
-    metadata = {"patch_pool_id": pool_id, "scale": SCALE, "num_patches": len(lr)}
+    metadata = {"patch_pool_id": pool_id, "num_patches": len(lr)}
+    if scale is not None:
+        metadata["scale"] = scale
     (pool_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
 
@@ -82,14 +86,33 @@ def test_epoch_plans_differ_between_epochs() -> None:
     assert sampler.epoch_plan(0)[0].tolist() != sampler.epoch_plan(1)[0].tolist()
 
 
-def test_epoch_can_be_requested_directly_and_matches_sequential_consumption() -> None:
-    """재개(T3.7)에서 3번째 에폭부터 시작해도 처음부터 돌린 것과 같은 계획이 나와야 한다."""
-    sequential = _sampler(2)
-    expected = [sequential.epoch_plan(epoch) for epoch in range(4)]
+@pytest.mark.parametrize(
+    ("seed", "augmentation", "want_idx", "want_code"),
+    [
+        (2, "rot90x4_hflip", [0, 10, 1, 7, 4, 3, 9, 6], [2, 2, 2, 0, 6, 0, 6, 3]),
+        (0, "none", [4, 8, 7, 10, 2, 5, 1, 0], [0] * PATCHES_PER_EPOCH),
+    ],
+)
+def test_epoch_requested_directly_equals_sequential_consumption_of_one_rng(
+    seed: int, augmentation: str, want_idx: list[int], want_code: list[int]
+) -> None:
+    """재개(T3.7)에서 에폭 3을 바로 요청해도, 데이터 난수 하나를 에폭 0부터 차례로 소비한 결과와 같아야 한다.
 
-    fresh = _sampler(2)
-    for epoch in (3, 1, 0, 2):  # 순서와 무관해야 한다
-        for got, want in zip(fresh.epoch_plan(epoch), expected[epoch]):
+    기준 값은 T3.3 이전 파일럿 구현(`a6d5409`의 `engine.pilot.sample_epoch_batches`)에 `create_data_rng(seed)` 하나를
+    넘겨 에폭 0~3을 차례로 돌린 결과에서 뽑아 고정했다.
+    """
+    patch_idx, aug_code = _sampler(seed, augmentation=augmentation).epoch_plan(3)
+
+    assert patch_idx.tolist() == want_idx
+    assert aug_code.tolist() == want_code
+
+
+def test_epoch_plan_does_not_depend_on_request_order() -> None:
+    sampler = _sampler(2)
+    expected = [_sampler(2).epoch_plan(epoch) for epoch in range(4)]
+
+    for epoch in (3, 1, 0, 2):
+        for got, want in zip(sampler.epoch_plan(epoch), expected[epoch]):
             np.testing.assert_array_equal(got, want)
 
 
@@ -199,6 +222,32 @@ def test_dataset_rejects_pool_with_wrong_hr_lr_scale(tmp_path: Path) -> None:
     _write_pool(tmp_path / "data", lr, _upscale_by_repeat(lr)[:, :-4])
     with pytest.raises(ValueError, match="x4"):
         PatchPoolDataset(tmp_path / "data", POOL_ID)
+
+
+def test_dataset_takes_scale_from_pool_metadata(tmp_path: Path) -> None:
+    lr = _random_lr(3)
+    _write_pool(tmp_path / "data", lr, np.repeat(np.repeat(lr, 2, axis=1), 2, axis=2), scale=2)
+
+    assert PatchPoolDataset(tmp_path / "data", POOL_ID).scale == 2
+
+
+@pytest.mark.parametrize("scale", [None, 0, True, 4.0])
+def test_dataset_rejects_missing_or_invalid_metadata_scale(tmp_path: Path, scale) -> None:
+    lr = _random_lr(3)
+    _write_pool(tmp_path / "data", lr, _upscale_by_repeat(lr), scale=scale)
+    with pytest.raises(ValueError, match="scale"):
+        PatchPoolDataset(tmp_path / "data", POOL_ID)
+
+
+@pytest.mark.parametrize("code", [-1, 8, True, 1.5])
+def test_augment_patch_rejects_codes_outside_the_eight_orientations(code) -> None:
+    with pytest.raises(ValueError, match="code"):
+        augment_patch(_random_lr(1)[0], code)
+
+
+def test_augment_patch_accepts_numpy_integer_codes() -> None:
+    patch = _random_lr(1)[0]
+    np.testing.assert_array_equal(augment_patch(patch, np.int64(7)), augment_patch(patch, 7))
 
 
 def test_epoch_batches_follow_the_sampler_plan_without_augmentation(pool_dir: Path) -> None:

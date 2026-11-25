@@ -33,7 +33,12 @@ def augment_patch(array: np.ndarray, code: int) -> np.ndarray:
     """(H, W, C) 배열에 8방향 중 하나(코드 0~7: 90° 회전 `code % 4`번, 4 이상이면 이어서 좌우 뒤집기)를 적용한다.
 
     HR·LR 패치 쌍에는 같은 코드를 써야 둘의 공간 대응이 유지된다.
+
+    Raises:
+        ValueError: `code`가 0~7의 정수가 아닐 때.
     """
+    if isinstance(code, bool) or not isinstance(code, (int, np.integer)) or not 0 <= code < AUGMENTATION_COUNT:
+        raise ValueError(f"증강 code는 0~{AUGMENTATION_COUNT - 1}의 정수여야 합니다: {code!r}")
     rotated = np.rot90(array, code % ROTATION_COUNT, axes=(0, 1))
     return np.ascontiguousarray(rotated[:, ::-1] if code >= ROTATION_COUNT else rotated)
 

@@ -102,6 +102,8 @@ def train_pilot_baseline(
     # 파일럿은 확정된 patch_pool_id가 아직 없어(null) 데이터가 알리는 ID를 그대로 쓴다. 본 실행은 구성의 값으로 검증한다.
     patch_pool_id = read_patch_pool_id(data_dir)
     dataset = PatchPoolDataset(data_dir, patch_pool_id)
+    if dataset.scale != SCALE:
+        raise ValueError(f"패치 풀의 배율(x{dataset.scale})이 모델 배율 x{SCALE}와 다릅니다: {patch_pool_id}")
     sampler = SeededEpochPatchSampler(len(dataset), patches_per_epoch, seed, augmentation=augmentation)
 
     set_model_seed(seed)

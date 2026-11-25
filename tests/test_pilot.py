@@ -29,6 +29,8 @@ from sr_pipeline.engine.pilot import (
 from sr_pipeline.evaluation.postprocess import quantize_and_shave
 from sr_pipeline.models.espcn import ESPCN
 
+pytestmark = pytest.mark.usefixtures("restore_global_random_state")  # train_pilot_baseline이 set_model_seed를 부른다
+
 SCALE = 4
 PATCH_HR = 16
 POOL_SIZE = 12
@@ -134,10 +136,24 @@ def test_train_rejects_empty_or_mismatched_pool_before_writing(tmp_path: Path, p
     pool_dir.mkdir(parents=True)
     np.save(pool_dir / "hr.npy", np.zeros(pool_shapes[0], dtype=np.uint8))
     np.save(pool_dir / "lr.npy", np.zeros(pool_shapes[1], dtype=np.uint8))
-    (pool_dir / "metadata.json").write_text(json.dumps({"patch_pool_id": "bad"}), encoding="utf-8")
+    (pool_dir / "metadata.json").write_text(json.dumps({"patch_pool_id": "bad", "scale": SCALE}), encoding="utf-8")
     checkpoint = tmp_path / "bad.pth"
 
     with pytest.raises(ValueError):
+        train_pilot_baseline(tmp_path / "data", checkpoint, **TRAIN_KWARGS)
+
+    assert not checkpoint.exists()
+
+
+def test_train_rejects_pool_whose_scale_differs_from_the_model_before_writing(tmp_path: Path) -> None:
+    pool_dir = tmp_path / "data" / "patch_pool"
+    pool_dir.mkdir(parents=True)
+    np.save(pool_dir / "hr.npy", np.zeros((2, 8, 8, 3), dtype=np.uint8))
+    np.save(pool_dir / "lr.npy", np.zeros((2, 4, 4, 3), dtype=np.uint8))
+    (pool_dir / "metadata.json").write_text(json.dumps({"patch_pool_id": "x2_pool", "scale": 2}), encoding="utf-8")
+    checkpoint = tmp_path / "bad.pth"
+
+    with pytest.raises(ValueError, match="x4"):
         train_pilot_baseline(tmp_path / "data", checkpoint, **TRAIN_KWARGS)
 
     assert not checkpoint.exists()
