@@ -487,11 +487,13 @@ def run_pilot_diagnosis(
     *,
     commit: str,
     edge_top_q: float | None = None,
+    sr_generation_commit: str | None = None,
 ) -> dict[str, Any]:
     """파일럿 SR 결과로 진단 4종을 돌리고, 쓴 설정을 `diagnosis_settings.json`에 남깁니다 (US 51).
 
     입력 폴더 구조와 산출물은 `run_diagnosis_suite`와 같다. HR 영상 폴더의 테스트셋은
     `fixed_rules.datasets`와 정확히 같아야 한다. `commit`은 이 진단을 실행한 코드 커밋이다.
+    `sr_generation_commit`은 SR 결과를 생성한 코드 커밋이며, 주어지면 함께 기록한다.
 
     산출물은 시스템 임시 폴더(저장소 밖)에 모두 만든 뒤 `output_dir`의 이전 진단 산출물과 바꾼다.
     그래서 다시 실행해도 이전 오차 지도가 섞이지 않고, 진단이나 교체 도중에 실패하면 `output_dir`은
@@ -503,6 +505,10 @@ def run_pilot_diagnosis(
         raise ValueError(f"commit은 이 진단을 실행한 코드 커밋이어야 합니다: {commit!r}")
     _check_hr_datasets(Path(hr_dir), settings["datasets"])
     settings["commit"] = commit.strip()
+    if sr_generation_commit is not None:
+        if not isinstance(sr_generation_commit, str) or not sr_generation_commit.strip():
+            raise ValueError("SR 생성 기록에 유효한 commit이 필요합니다.")
+        settings["sr_generation_commit"] = sr_generation_commit.strip()
 
     work_dir = Path(tempfile.mkdtemp(prefix="pilot_diagnosis_"))
     staging_dir, backup_dir = work_dir / "staging", work_dir / "backup"

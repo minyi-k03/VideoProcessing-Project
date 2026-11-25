@@ -7,6 +7,7 @@
 읽는다. HR 영상 폴더의 테스트셋이 그 목록과 다르면 멈춘다.
 `edge_top_q`는 T4.2에서 확정되기 전이면 `--edge-top-q`로 넘겨야 하고, 확정 후에는 파일 값과 같아야 한다.
 쓴 값과 출처, 이 저장소의 현재 커밋은 `<output-dir>/diagnosis_settings.json`에 남는다.
+SR 생성 기록이 있으면 생성 코드 커밋도 남긴다. `--require-sr-provenance`로 생성 기록을 필수로 할 수 있다.
 `src/`·`scripts/`·`configs/`에 커밋되지 않은 변경이 있으면 멈춘다(`--allow-dirty`면 커밋 뒤에 `-dirty`를 붙여 기록).
 
 같은 `--output-dir`에 다시 실행하면 진단 산출물만 바뀐다(이전 오차 지도가 섞이지 않고, 실패하면 이전 결과 그대로).
@@ -16,12 +17,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import yaml
 
 from sr_pipeline.diagnosis.diagnostics import run_pilot_diagnosis
-from sr_pipeline.diagnosis.provenance import resolve_code_commit
+from sr_pipeline.diagnosis.provenance import SR_GENERATION_SETTINGS_FILENAME, resolve_code_commit
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,6 +33,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sr-dir", type=Path, required=True, help="Pilot SR outputs root (<dataset>/<image_id>.png).")
     parser.add_argument("--hr-dir", type=Path, required=True, help="Testsets root (<dataset>/HR/<image_id>.png).")
     parser.add_argument("--output-dir", type=Path, default=Path("results/pilot"), help="Pilot diagnosis output dir.")
+    parser.add_argument("--require-sr-provenance", action="store_true", help="Require the SR generation commit.")
     parser.add_argument(
         "--edge-top-q",
         type=float,
@@ -61,6 +64,15 @@ def main(argv: list[str] | None = None) -> None:
     with args.fair_comparison_config.open(encoding="utf-8") as file:
         fair_comparison = yaml.safe_load(file)
 
+    provenance_path = args.sr_dir / SR_GENERATION_SETTINGS_FILENAME
+    generation_commit = None
+    if args.require_sr_provenance or provenance_path.exists():
+        with provenance_path.open(encoding="utf-8") as file:
+            provenance = json.load(file)
+        generation_commit = provenance.get("commit") if isinstance(provenance, dict) else None
+        if not isinstance(generation_commit, str) or not generation_commit.strip():
+            raise ValueError("SR 생성 기록에 유효한 commit이 필요합니다.")
+
     record = run_pilot_diagnosis(
         args.sr_dir,
         args.hr_dir,
@@ -68,6 +80,7 @@ def main(argv: list[str] | None = None) -> None:
         fair_comparison,
         commit=commit,
         edge_top_q=args.edge_top_q,
+        sr_generation_commit=generation_commit,
     )
     for key, value in record.items():
         print(f"{key}: {value}")

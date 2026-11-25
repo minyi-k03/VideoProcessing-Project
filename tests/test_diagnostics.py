@@ -371,6 +371,21 @@ def test_pilot_diagnosis_cli_records_command_line_q_while_unfixed(tmp_path: Path
     }
 
 
+def test_pilot_diagnosis_cli_records_separate_sr_generation_commit(tmp_path: Path) -> None:
+    sr_root, hr_root, out = _write_pilot_pairs(tmp_path, count=1)
+    config = tmp_path / "fair_comparison.yaml"
+    config.write_text(yaml.safe_dump(_fair_comparison(None)), encoding="utf-8")
+    generation_commit = "a" * 40
+    (sr_root / "sr_generation_settings.json").write_text(
+        json.dumps({"commit": generation_commit}), encoding="utf-8"
+    )
+
+    settings = _run_pilot_cli(sr_root, hr_root, out, config, edge_top_q="20")
+
+    assert settings["commit"] == COMMIT
+    assert settings["sr_generation_commit"] == generation_commit
+
+
 def test_pilot_diagnosis_cli_runs_with_repo_fair_comparison_config(tmp_path: Path) -> None:
     """실제 configs/fair_comparison.yaml로 실행한다. edge_top_q 확정(T4.2) 전후 모두 통과해야 한다."""
     config = REPO_ROOT / "configs" / "fair_comparison.yaml"

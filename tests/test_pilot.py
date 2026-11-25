@@ -588,7 +588,9 @@ def test_bicubic_cli_writes_sr_results_without_printing_paths(
     _write_testsets(data_dir, dataset_names, ((16, 16),))
     sr_dir = tmp_path / "bicubic_sr"
 
-    _load_bicubic_cli().main(
+    cli = _load_bicubic_cli()
+    cli.resolve_code_commit = lambda repo_root, *, allow_dirty: COMMIT
+    cli.main(
         [
             "--data-dir",
             str(data_dir),
@@ -603,8 +605,23 @@ def test_bicubic_cli_writes_sr_results_without_printing_paths(
 
     for name in dataset_names:
         assert (sr_dir / name / "img0.png").is_file()
+    generation = json.loads((sr_dir / "sr_generation_settings.json").read_text(encoding="utf-8"))
+    assert generation == {"commit": COMMIT}
     captured = capsys.readouterr()
     for path in (tmp_path, data_dir):
         assert str(path) not in captured.out
         assert str(path) not in captured.err
+
+
+def test_bicubic_cli_rejects_scale_mismatch_before_writing(tmp_path: Path) -> None:
+    config = tmp_path / "fair.yaml"
+    config.write_text(yaml.safe_dump({"fixed_rules": {"scale": 2, "datasets": ["Set5"]}}), encoding="utf-8")
+    sr_dir = tmp_path / "sr"
+
+    with pytest.raises(ValueError, match=r"fixed_rules\.scale"):
+        _load_bicubic_cli().main([
+            "--data-dir", str(tmp_path), "--sr-dir", str(sr_dir), "--fair-comparison-config", str(config),
+        ])
+
+    assert not sr_dir.exists()
 
