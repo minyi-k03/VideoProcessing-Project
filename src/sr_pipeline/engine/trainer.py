@@ -40,6 +40,7 @@ SUPPORTED_OPTIMIZERS = ("adam",)
 SUPPORTED_SCHEDULERS = ("none",)
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
+DIRTY_SUFFIX = "-dirty"
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -56,7 +57,7 @@ def check_git_clean(repo_root: Path, allow_dirty: bool = False) -> str:
     파일럿 진단과 같은 규칙(`diagnosis.provenance`)을 쓴다.
     """
     commit = resolve_code_commit(repo_root, allow_dirty=allow_dirty)
-    if commit.endswith("-dirty"):
+    if commit.endswith(DIRTY_SUFFIX):
         warnings.warn(
             "코드·설정에 커밋되지 않은 변경이 있는 채로 실행합니다. 이 실행의 커밋은 실제로 돈 코드와 일치하지 않습니다.",
             stacklevel=2,
@@ -110,14 +111,18 @@ def _check_choice(value: Any, name: str, supported: tuple[str, ...]) -> None:
         raise ValueError(f"{name}은(는) {supported} 중 하나여야 합니다: {value!r}")
 
 
-def _check_training_settings(pilot: dict[str, Any]) -> None:
-    for name in ("patch_pool_size", "patches_per_epoch", "epochs", "batch_size"):
+def _check_positive_finite(value: Any, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (math.isfinite(value) and value > 0):
+        raise ValueError(f"{name}은(는) 0보다 큰 유한한 수여야 합니다: {value!r}")
+
+
+def _check_training_settings(fair_comparison: dict[str, Any]) -> None:
+    # 3시간 상한: 0 이하면 학습 없이 멈추고, NaN·무한대면 상한이 꺼진다.
+    _check_positive_finite(fair_comparison["fixed_rules"]["max_hours"], "max_hours")
+    pilot = fair_comparison["pilot_determined"]
+    for name in ("patch_pool_size", "patch_size_hr", "patches_per_epoch", "epochs", "batch_size"):
         _check_positive_int(pilot[name], name)
-    learning_rate = pilot["learning_rate"]
-    if isinstance(learning_rate, bool) or not isinstance(learning_rate, (int, float)):
-        raise ValueError(f"learning_rate는 숫자여야 합니다: {learning_rate!r}")
-    if not (math.isfinite(learning_rate) and learning_rate > 0):
-        raise ValueError(f"learning_rate는 0보다 큰 유한한 수여야 합니다: {learning_rate!r}")
+    _check_positive_finite(pilot["learning_rate"], "learning_rate")
     _check_choice(pilot["optimizer"], "optimizer", SUPPORTED_OPTIMIZERS)
     _check_choice(pilot["scheduler"], "scheduler", SUPPORTED_SCHEDULERS)
     check_augmentation(pilot["augmentation"])
@@ -149,8 +154,12 @@ def _atomic_save(obj: Any, path: Path) -> None:
 def _write_train_log(path: Path, log: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".partial")
-    partial.write_text(json.dumps(log, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    partial.replace(path)
+    try:
+        partial.write_text(json.dumps(log, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        partial.replace(path)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def train_run(
@@ -173,16 +182,25 @@ def train_run(
         raise ValueError(f"구성 {run_config.config_id}는 학습하지 않는 구성이라 학습할 수 없습니다.")
     fair = run_config.fair_comparison
     pilot = fair["pilot_determined"]
-    _check_training_settings(pilot)
+    _check_training_settings(fair)
     run_id = build_run_id(commit, run_config.config_id, run_config.seed)
+    if resume and commit.endswith(DIRTY_SUFFIX):
+        raise ValueError(
+            f"커밋되지 않은 변경이 있는 채로 시작한 실행({run_id})은 재개할 수 없습니다: 끊긴 사이 코드가 또 바뀌었는지 "
+            "run_id로 확인할 수 없습니다. 처음부터 다시 실행하세요."
+        )
 
     state_path = Path(checkpoint_dir) / run_id / STATE_FILENAME
+    weights_path = Path(checkpoint_dir) / run_id / WEIGHTS_FILENAME
+    log_path = Path(output_dir) / run_id / TRAIN_LOG_FILENAME
     fingerprint = _settings_fingerprint(fair)
-    if not resume and state_path.exists():
-        raise FileExistsError(
-            f"실행 {run_id}의 체크포인트가 이미 있습니다. 이어서 학습하려면 resume=True로 부르고, "
-            "처음부터 다시 하려면 체크포인트 폴더를 지우세요(이전 실행과 섞이지 않도록 자동으로 덮어쓰지 않습니다)."
-        )
+    if not resume:
+        existing = [path.name for path in (state_path, weights_path, log_path) if path.exists()]
+        if existing:
+            raise FileExistsError(
+                f"실행 {run_id}의 이전 파일({', '.join(existing)})이 이미 있습니다. 이어서 학습하려면 resume=True로 부르고, "
+                "처음부터 다시 하려면 이 실행의 체크포인트·기록 폴더를 지우세요(이전 실행과 섞이지 않도록 자동으로 덮어쓰지 않습니다)."
+            )
 
     dataset = PatchPoolDataset(data_dir, pilot["patch_pool_id"])
     if dataset.scale != SCALE:
@@ -190,6 +208,11 @@ def train_run(
     if len(dataset) != pilot["patch_pool_size"]:
         raise ValueError(
             f"패치 풀 크기({len(dataset)})가 patch_pool_size({pilot['patch_pool_size']})와 다릅니다: {dataset.patch_pool_id}"
+        )
+    patch_size_hr = pilot["patch_size_hr"]
+    if dataset.hr_patch_size != (patch_size_hr, patch_size_hr):
+        raise ValueError(
+            f"패치 풀의 HR 패치 크기 {dataset.hr_patch_size}가 patch_size_hr({patch_size_hr})과 다릅니다: {dataset.patch_pool_id}"
         )
     sampler = SeededEpochPatchSampler(
         len(dataset), pilot["patches_per_epoch"], run_config.seed, augmentation=pilot["augmentation"]
@@ -249,11 +272,11 @@ def train_run(
     epochs_done = len(epoch_losses)
     status = COMPLETE if epochs_done == epochs_total else INCOMPLETE
 
-    _atomic_save(model.state_dict(), Path(checkpoint_dir) / run_id / WEIGHTS_FILENAME)
+    _atomic_save(model.state_dict(), weights_path)
     params = count_parameters(model)
     switches = run_config.switches
     _write_train_log(
-        Path(output_dir) / run_id / TRAIN_LOG_FILENAME,
+        log_path,
         {
             "run_id": run_id,
             "commit": commit,
@@ -297,10 +320,12 @@ def train_and_evaluate(
     순서: 코드 커밋 확인(커밋 안 된 변경이면 거부, `allow_dirty`면 `-dirty` 표시) → 학습(학습 없는 구성은 건너뜀) →
     평가 체크포인트(마지막으로 끝낸 에폭의 모델)로 `evaluate_model`. 3시간 상한에 걸려 멈춘 실행도 평가하되
     `run_meta["status"]`를 `incomplete`로 넘긴다. `resume_run_id`가 있으면 그 실행을 이어서 학습하며,
-    이번 실행의 run_id와 다르면 거부한다.
+    이번 실행의 run_id와 다르거나, 학습 없는 구성이거나, `-dirty` 실행이면 거부한다.
     """
     commit = check_git_clean(repo_root, allow_dirty=allow_dirty)
     run_id = build_run_id(commit, run_config.config_id, run_config.seed)
+    if resume_run_id is not None and not run_config.trainable:
+        raise ValueError(f"구성 {run_config.config_id}는 학습하지 않는 구성이라 재개할 학습이 없습니다: {resume_run_id}")
     if resume_run_id is not None and resume_run_id != run_id:
         raise ValueError(f"resume_run_id({resume_run_id})가 이번 실행의 run_id({run_id})와 다릅니다.")
 

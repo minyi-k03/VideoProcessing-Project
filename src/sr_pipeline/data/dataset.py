@@ -58,6 +58,11 @@ class PatchPoolDataset:
     def __len__(self) -> int:
         return self._hr.shape[0]
 
+    @property
+    def hr_patch_size(self) -> tuple[int, int]:
+        """HR 패치의 `(높이, 너비)`. 학습 설정의 `patch_size_hr`과 맞는지는 호출자가 확인한다."""
+        return int(self._hr.shape[1]), int(self._hr.shape[2])
+
     def iter_epoch_batches(
         self, sampler: SeededEpochPatchSampler, epoch: int, batch_size: int
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:

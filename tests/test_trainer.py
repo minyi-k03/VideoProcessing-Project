@@ -308,6 +308,27 @@ def test_fresh_start_is_refused_when_the_run_already_has_a_checkpoint(tmp_path: 
     assert json.loads(log_path.read_text(encoding="utf-8"))["epoch_losses"] == first.epoch_losses
 
 
+@pytest.mark.parametrize("left_behind", ["record_only", "weights_only"])
+def test_fresh_start_is_refused_when_an_earlier_record_or_weights_remain(
+    tmp_path: Path, data_dir: Path, left_behind: str
+) -> None:
+    run_config = _run_config(tmp_path)
+    first = _train(tmp_path, data_dir, run_config)
+    checkpoint_dir = tmp_path / "run" / "checkpoints" / first.run_id
+    log_path = tmp_path / "run" / "records" / first.run_id / TRAIN_LOG_FILENAME
+    if left_behind == "record_only":  # 체크포인트 폴더만 지운 상황
+        shutil.rmtree(checkpoint_dir)
+    else:  # 평가 체크포인트만 남은 상황
+        (checkpoint_dir / STATE_FILENAME).unlink()
+        log_path.unlink()
+    remaining = {path: path.read_bytes() for path in (log_path, checkpoint_dir / WEIGHTS_FILENAME) if path.exists()}
+
+    with pytest.raises(FileExistsError):
+        _train(tmp_path, data_dir, run_config)
+    assert {path: path.read_bytes() for path in remaining} == remaining
+    assert not (checkpoint_dir / STATE_FILENAME).exists()
+
+
 def test_resume_without_a_checkpoint_is_refused(tmp_path: Path, data_dir: Path) -> None:
     with pytest.raises(FileNotFoundError):
         _train(tmp_path, data_dir, _run_config(tmp_path), resume=True)
@@ -332,6 +353,31 @@ def test_resume_is_refused_for_a_checkpoint_of_another_run(tmp_path: Path, data_
         _train(tmp_path, data_dir, _run_config(tmp_path, seed=1), resume=True)
 
 
+def test_a_run_started_with_uncommitted_changes_cannot_be_resumed(tmp_path: Path, data_dir: Path) -> None:
+    # `-dirty` 실행은 끊긴 사이 코드가 또 바뀌었는지 run_id로 알 수 없으므로 이어서 학습하지 않는다.
+    run_config = _run_config(tmp_path)
+    kwargs = {"commit": COMMIT + "-dirty"}
+    with pytest.raises(ConnectionError):
+        train_run(
+            run_config, data_dir, tmp_path / "records", tmp_path / "checkpoints", clock=TickClock(fail_at_call=5), **kwargs
+        )
+    with pytest.raises(ValueError, match="dirty"):
+        train_run(run_config, data_dir, tmp_path / "records", tmp_path / "checkpoints", resume=True, **kwargs)
+
+
+def test_a_failed_train_log_write_leaves_no_partial_file(tmp_path: Path, data_dir: Path) -> None:
+    run_config = _run_config(tmp_path)
+    with pytest.raises(ConnectionError):
+        _train(tmp_path, data_dir, run_config, clock=TickClock(fail_at_call=5))
+    run_id = build_run_id(COMMIT, "baseline", 0)
+    log_path = tmp_path / "run" / "records" / run_id / TRAIN_LOG_FILENAME
+    log_path.mkdir(parents=True)  # 학습 기록을 그 이름으로 쓸 수 없는 상황
+
+    with pytest.raises(OSError):
+        _train(tmp_path, data_dir, run_config, resume=True)
+    assert list(log_path.parent.iterdir()) == [log_path]
+
+
 # ---- 구성별 스위치 배선 (US28-29) ----
 
 ONE_EPOCH = {"epochs": 1}
@@ -339,7 +385,17 @@ ONE_EPOCH = {"epochs": 1}
 
 @pytest.mark.parametrize(
     ("config_id", "params"),
-    [("baseline", 37_200), ("A", 37_200), ("B", 24_752), ("AB", 24_752), ("C", 37_200), ("Bp", 37_200)],
+    [
+        ("baseline", 37_200),
+        ("A", 37_200),
+        ("B", 24_752),
+        ("AB", 24_752),
+        ("C", 37_200),
+        ("Bp", 37_200),
+        ("AC", 37_200),
+        ("BC", 24_752),
+        ("ABC", 24_752),
+    ],
 )
 def test_every_trainable_config_trains_and_reports_its_parameter_count(
     tmp_path: Path, data_dir: Path, config_id: str, params: int
@@ -397,14 +453,24 @@ def test_a_config_without_training_is_refused_before_anything_is_written(tmp_pat
         {"augmentation": "mixup"},
         {"patch_pool_id": "other_pool"},
         {"patch_pool_size": POOL_SIZE + 1},
+        {"patch_size_hr": 0},
+        {"patch_size_hr": PATCH_HR * 2},
     ],
-    ids=lambda pilot: next(iter(pilot)),
+    ids=lambda pilot: "-".join(f"{key}={value}" for key, value in pilot.items()),
 )
 def test_invalid_settings_or_mismatched_pool_fail_before_anything_is_written(
     tmp_path: Path, data_dir: Path, pilot: dict[str, Any]
 ) -> None:
     with pytest.raises(ValueError):
         _train(tmp_path, data_dir, _run_config(tmp_path, pilot=pilot))
+    assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize("max_hours", [0.0, -1.0, float("nan"), float("inf"), True])
+def test_invalid_time_cap_fails_before_anything_is_written(tmp_path: Path, data_dir: Path, max_hours: Any) -> None:
+    # 0 이하면 학습 없이 멈추고, NaN·무한대면 상한이 꺼진다.
+    with pytest.raises(ValueError, match="max_hours"):
+        _train(tmp_path, data_dir, _run_config(tmp_path, max_hours=max_hours))
     assert not (tmp_path / "run").exists()
 
 
@@ -459,7 +525,10 @@ def test_train_and_evaluate_trains_then_hands_the_model_and_run_meta_to_the_eval
     (call,) = evaluator.calls
     assert call["output_dir"] == run_dir and call["data_dir"] == data_dir
     assert call["model"].use_y_channel and not call["model"].training
-    assert call["run_meta"] == {
+    run_meta = dict(call["run_meta"])
+    train_minutes = run_meta.pop("train_minutes")
+    assert isinstance(train_minutes, float) and np.isfinite(train_minutes) and train_minutes >= 0
+    assert run_meta == {
         "run_id": run_id,
         "commit": commit,
         "config_id": "B",
@@ -467,10 +536,26 @@ def test_train_and_evaluate_trains_then_hands_the_model_and_run_meta_to_the_eval
         "patch_pool_id": POOL_ID,
         "switches": {"A": False, "B": True, "C": False, "Bp": False},
         "params": 24_752,
-        "train_minutes": call["run_meta"]["train_minutes"],
         "status": "complete",
     }
-    assert (run_dir / TRAIN_LOG_FILENAME).is_file()
+    log = json.loads((run_dir / TRAIN_LOG_FILENAME).read_text(encoding="utf-8"))
+    assert log["train_minutes"] == train_minutes
+
+
+@needs_git
+def test_train_and_evaluate_hands_incomplete_status_to_the_evaluator_when_capped(
+    tmp_path: Path, data_dir: Path, repo: Path, evaluator: FakeEvaluator
+) -> None:
+    # 상한(약 3.6마이크로초)이 첫 에폭 학습 시간보다 짧아, 첫 에폭을 끝낸 뒤 멈춘다.
+    run_dir = train_and_evaluate(
+        _run_config(tmp_path, max_hours=1e-9), data_dir, tmp_path / "records", tmp_path / "checkpoints", repo_root=repo
+    )
+
+    (call,) = evaluator.calls
+    assert call["run_meta"]["status"] == "incomplete"
+    assert call["run_meta"]["train_minutes"] > 0
+    log = json.loads((run_dir / TRAIN_LOG_FILENAME).read_text(encoding="utf-8"))
+    assert (log["status"], log["epochs_done"], log["epochs_total"]) == ("incomplete", 1, 3)
 
 
 @needs_git
@@ -514,6 +599,23 @@ def test_train_and_evaluate_skips_training_for_a_config_without_training(
     assert call["model"] is None
     assert (call["run_meta"]["status"], call["run_meta"]["train_minutes"], call["run_meta"]["params"]) == ("complete", 0.0, 0)
     assert not (run_dir / TRAIN_LOG_FILENAME).exists() and not (tmp_path / "checkpoints").exists()
+
+
+@needs_git
+def test_train_and_evaluate_refuses_resume_for_a_config_without_training(
+    tmp_path: Path, data_dir: Path, repo: Path, evaluator: FakeEvaluator
+) -> None:
+    run_id = build_run_id(_git(repo, "rev-parse", "HEAD"), "bicubic", 0)
+    with pytest.raises(ValueError, match="학습"):
+        train_and_evaluate(
+            _run_config(tmp_path, "bicubic"),
+            data_dir,
+            tmp_path / "records",
+            tmp_path / "checkpoints",
+            resume_run_id=run_id,
+            repo_root=repo,
+        )
+    assert evaluator.calls == []
 
 
 @needs_git
