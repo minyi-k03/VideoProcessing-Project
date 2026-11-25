@@ -10,6 +10,9 @@ def test_all_configs_run_end_to_end_on_tiny_synthetic_data() -> None:
     """모든 구성이 작은 합성 데이터·1에폭에서 완주하고 형식에 맞는 summary/per_image 행을 생성해야 합니다."""
 
 
-@pytest.mark.skip(reason="Skeleton test: implement alongside engine.trainer")
+@pytest.mark.skip(
+    reason="Needs evaluation.evaluator (T3.6) for metric-level reproducibility (T3.9); "
+    "training-level reproducibility (weights, losses, resume) is covered by tests/test_trainer.py"
+)
 def test_same_config_and_seed_reproducible() -> None:
     """같은 구성·시드를 두 번 실행하면 동일한 지표를 얻어야 합니다."""
