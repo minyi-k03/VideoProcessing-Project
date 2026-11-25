@@ -18,6 +18,7 @@ from sr_pipeline.config.schema import (
     load_fair_comparison,
     resolve_run_config,
 )
+from sr_pipeline.data.sampler import SeededEpochPatchSampler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_FAIR = REPO_ROOT / "configs" / "fair_comparison.yaml"
@@ -264,11 +265,38 @@ def test_resolved_configs_do_not_share_mutable_state(tmp_path: Path) -> None:
     assert second.fair_comparison["pilot_determined"]["epochs"] == 1
 
 
-@pytest.mark.skip(reason="Skeleton test: implement alongside data.sampler")
-def test_sampler_same_order_for_same_seed_across_configs() -> None:
+def _sampler_for(run: Any) -> SeededEpochPatchSampler:
+    """확정된 실행 조건의 공정 비교 값만으로 샘플러를 만든다(트레이너가 쓰는 방식)."""
+    determined = run.fair_comparison["pilot_determined"]
+    return SeededEpochPatchSampler(
+        determined["patch_pool_size"],
+        determined["patches_per_epoch"],
+        run.seed,
+        augmentation=determined["augmentation"],
+    )
+
+
+def _plans(sampler: SeededEpochPatchSampler, epochs: int = 3) -> list[tuple[list[int], list[int]]]:
+    return [tuple(part.tolist() for part in sampler.epoch_plan(epoch)) for epoch in range(epochs)]
+
+
+# ---- 샘플러: 시드가 순서를 정한다 (US32) ----
+
+
+def test_sampler_same_order_for_same_seed_across_configs(tmp_path: Path) -> None:
     """같은 시드면 구성이 달라도 샘플러가 동일한 패치 순서를 생성해야 합니다."""
+    fair = _synthetic_fair(tmp_path)
+    config_ids = [config_id for config_id in yaml.safe_load(REAL_EXPERIMENTS.read_text(encoding="utf-8"))["configs"] if config_id != "bicubic"]
+    assert len(config_ids) > 1
+
+    for seed in (0, 1, 2):
+        plans = {config_id: _plans(_sampler_for(resolve_run_config(fair, REAL_EXPERIMENTS, config_id, seed=seed)))
+                 for config_id in config_ids}
+        assert all(plan == plans["baseline"] for plan in plans.values()), f"seed {seed}에서 구성별 순서가 다르다"
 
 
-@pytest.mark.skip(reason="Skeleton test: implement alongside data.sampler")
-def test_sampler_different_order_for_different_seeds() -> None:
+def test_sampler_different_order_for_different_seeds(tmp_path: Path) -> None:
     """시드가 다르면 다른 패치 순서를 생성해야 합니다."""
+    fair = _synthetic_fair(tmp_path)
+    plans = [_plans(_sampler_for(resolve_run_config(fair, REAL_EXPERIMENTS, "baseline", seed=seed))) for seed in (0, 1, 2)]
+    assert plans[0] != plans[1] and plans[0] != plans[2] and plans[1] != plans[2]

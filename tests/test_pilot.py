@@ -19,13 +19,11 @@ import yaml
 from PIL import Image
 
 from sr_pipeline.common.bicubic import bicubic_resize
-from sr_pipeline.common.seed import create_data_rng
 from sr_pipeline.diagnosis.diagnostics import run_pilot_diagnosis
 from sr_pipeline.engine.pilot import (
     collect_testset_lr_images,
     generate_bicubic_sr_results,
     generate_sr_results,
-    sample_epoch_batches,
     train_pilot_baseline,
 )
 from sr_pipeline.evaluation.postprocess import quantize_and_shave
@@ -65,64 +63,6 @@ def data_dir(tmp_path: Path) -> Path:
     path = tmp_path / "data"
     _write_pool(path)
     return path
-
-
-def _upscale_by_repeat(lr: np.ndarray) -> np.ndarray:
-    """(…, h, w, 3) → (…, h·4, w·4, 3) 화소 복제. 회전·뒤집기와 교환되므로 HR·LR 대응의 독립 기준이 된다."""
-    return np.repeat(np.repeat(lr, SCALE, axis=-3), SCALE, axis=-2)
-
-
-def test_epoch_batches_keep_hr_lr_spatial_correspondence_under_augmentation() -> None:
-    rng = np.random.default_rng(1)
-    lr_pool = rng.integers(0, 256, (6, 4, 4, 3), dtype=np.uint8)
-    hr_pool = _upscale_by_repeat(lr_pool)
-
-    batches = list(
-        sample_epoch_batches(
-            hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=40, batch_size=8, augmentation="rot90x4_hflip"
-        )
-    )
-
-    for lr, hr in batches:
-        np.testing.assert_array_equal(hr, _upscale_by_repeat(lr))
-    originals = {patch.tobytes() for patch in lr_pool}
-    augmented = [patch for lr, _ in batches for patch in lr if patch.tobytes() not in originals]
-    assert augmented, "증강(회전·뒤집기)이 한 번도 적용되지 않았다"
-
-
-def test_epoch_batches_without_augmentation_keeps_original_patches() -> None:
-    rng = np.random.default_rng(1)
-    lr_pool = rng.integers(0, 256, (6, 4, 4, 3), dtype=np.uint8)
-    hr_pool = _upscale_by_repeat(lr_pool)
-
-    batches = list(
-        sample_epoch_batches(
-            hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=12, batch_size=4, augmentation="none"
-        )
-    )
-
-    originals = {patch.tobytes() for patch in lr_pool}
-    for lr, hr in batches:
-        np.testing.assert_array_equal(hr, _upscale_by_repeat(lr))
-        assert all(patch.tobytes() in originals for patch in lr)
-
-
-def test_epoch_batches_cover_pool_evenly_when_epoch_exceeds_pool() -> None:
-    # 패치마다 단색(값 = 인덱스 × 10)이라 증강 후에도 어떤 패치인지 알 수 있다.
-    lr_pool = np.stack([np.full((4, 4, 3), index * 10, dtype=np.uint8) for index in range(5)])
-    hr_pool = _upscale_by_repeat(lr_pool)
-
-    batches = list(
-        sample_epoch_batches(
-            hr_pool, lr_pool, create_data_rng(0), patches_per_epoch=13, batch_size=4, augmentation="rot90x4_hflip"
-        )
-    )
-
-    assert [len(lr) for lr, _ in batches] == [4, 4, 4, 1]
-    seen = np.concatenate([lr[:, 0, 0, 0] // 10 for lr, _ in batches])
-    counts = np.bincount(seen, minlength=5)
-    assert counts.sum() == 13
-    assert set(counts.tolist()) <= {2, 3}  # 풀 2바퀴(10개) + 세 번째 바퀴 3개
 
 
 def test_train_writes_checkpoint_and_finite_epoch_losses(data_dir: Path, tmp_path: Path) -> None:

@@ -6,17 +6,17 @@
 - 모델은 `ESPCN()`(모든 스위치가 꺼진 구성 = 베이스라인), 손실은 `SRLoss()`(자르지 않은 SR 결과의 L1)다.
 - `pilot_determined`가 `null`인 항목(에폭 수·에폭당 패치 수·배치 크기·학습률·옵티마이저·스케줄·증강)은
   코드에 기본값을 두지 않고 호출자가 필수로 넘긴다. 쓴 값은 반환값에 남는다.
-- 데이터 난수(패치 선택·순서·증강)는 `create_data_rng`에서만 뽑고, 모델 난수는 `set_model_seed`로 고정한다.
+- 데이터 난수(패치 선택·순서·증강)는 공용 `SeededEpochPatchSampler`(`data.sampler`)가 `create_data_rng`에서만 뽑고,
+  모델 난수는 `set_model_seed`로 고정한다.
 """
 
 from __future__ import annotations
 
-import json
 import math
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -26,18 +26,15 @@ from PIL import Image
 
 from sr_pipeline.common.bicubic import bicubic_resize
 from sr_pipeline.common.seed import create_data_rng, set_model_seed
+from sr_pipeline.data.dataset import PatchPoolDataset, read_patch_pool_id
+from sr_pipeline.data.sampler import SeededEpochPatchSampler, check_augmentation
 from sr_pipeline.evaluation.postprocess import quantize_and_shave
 from sr_pipeline.losses.sr_loss import SRLoss
 from sr_pipeline.models.espcn import ESPCN, SCALE
 
-POOL_DIRNAME = "patch_pool"
-POOL_METADATA_FILENAME = "metadata.json"
 LR_DIRNAME = "LR"
-ROTATION_COUNT = 4
-AUGMENTATION_COUNT = ROTATION_COUNT * 2  # 회전 4 × 좌우 뒤집기 2
 SUPPORTED_OPTIMIZERS = ("adam",)
 SUPPORTED_SCHEDULERS = ("none",)
-SUPPORTED_AUGMENTATIONS = ("rot90x4_hflip", "none")
 
 
 def _check_positive_int(value: Any, name: str) -> None:
@@ -68,69 +65,12 @@ def _check_training_settings(
         raise ValueError(f"learning_rate는 0보다 큰 유한한 수여야 합니다: {learning_rate!r}")
     _check_choice(optimizer, "optimizer", SUPPORTED_OPTIMIZERS)
     _check_choice(scheduler, "scheduler", SUPPORTED_SCHEDULERS)
-    _check_choice(augmentation, "augmentation", SUPPORTED_AUGMENTATIONS)
-
-
-def _load_pool(data_dir: Path) -> tuple[np.ndarray, np.ndarray, str]:
-    pool_dir = Path(data_dir) / POOL_DIRNAME
-    metadata = json.loads((pool_dir / POOL_METADATA_FILENAME).read_text(encoding="utf-8"))
-    hr = np.load(pool_dir / "hr.npy")
-    lr = np.load(pool_dir / "lr.npy")
-    if hr.ndim != 4 or lr.ndim != 4 or hr.shape[-1] != 3 or lr.shape[-1] != 3:
-        raise ValueError(f"패치 풀은 (N, H, W, 3) 배열이어야 합니다: HR {hr.shape}, LR {lr.shape}")
-    if hr.shape[0] != lr.shape[0]:
-        raise ValueError(f"패치 풀의 HR·LR 개수가 다릅니다: {hr.shape[0]} vs {lr.shape[0]}")
-    if hr.shape[0] == 0:
-        raise ValueError("패치 풀이 비어 있습니다.")
-    if hr.shape[1:3] != (lr.shape[1] * SCALE, lr.shape[2] * SCALE):
-        raise ValueError(f"HR 패치 크기가 LR의 x{SCALE}가 아닙니다: HR {hr.shape[1:3]}, LR {lr.shape[1:3]}")
-    return hr, lr, str(metadata["patch_pool_id"])
-
-
-def _augment(array: np.ndarray, code: int) -> np.ndarray:
-    """(H, W, 3) 배열에 8방향 중 하나(코드 0~7)를 적용한다. HR·LR에 같은 코드를 쓴다."""
-    rotated = np.rot90(array, code % ROTATION_COUNT, axes=(0, 1))
-    return np.ascontiguousarray(rotated[:, ::-1] if code >= ROTATION_COUNT else rotated)
+    check_augmentation(augmentation)
 
 
 def _to_tensor(batch: np.ndarray, device: torch.device) -> torch.Tensor:
     """(B, H, W, 3) uint8을 [0, 1] float32 (B, 3, H, W)로 바꾼다."""
     return torch.from_numpy(batch).permute(0, 3, 1, 2).to(device=device, dtype=torch.float32).div_(255.0)
-
-
-def sample_epoch_batches(
-    hr_pool: np.ndarray,
-    lr_pool: np.ndarray,
-    rng: np.random.Generator,
-    patches_per_epoch: int,
-    batch_size: int,
-    *,
-    augmentation: str,
-) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-    """한 에폭의 (LR, HR) uint8 배치 `(B, h, w, 3)`, `(B, h·배율, w·배율, 3)`을 차례로 내보냅니다.
-
-    풀의 순열을 필요한 만큼 이어 붙여 앞에서 `patches_per_epoch`개를 고르고(풀보다 적으면 비복원,
-    많으면 풀을 여러 바퀴 돈다) 뒤섞은 뒤, `augmentation`에 따라 변환을 적용한다(`"rot90x4_hflip"`은
-    8방향 중 하나를 HR·LR에 같게 적용, `"none"`은 변환 없음).
-    난수는 `rng`에서만 뽑는다. 마지막 배치는 `batch_size`보다 작을 수 있다.
-    """
-    _check_choice(augmentation, "augmentation", SUPPORTED_AUGMENTATIONS)
-    pool_size = hr_pool.shape[0]
-    chosen = np.concatenate(
-        [rng.permutation(pool_size) for _ in range(math.ceil(patches_per_epoch / pool_size))]
-    )[:patches_per_epoch]
-    rng.shuffle(chosen)
-    if augmentation == "rot90x4_hflip":
-        codes = rng.integers(0, AUGMENTATION_COUNT, size=patches_per_epoch)
-        for start in range(0, patches_per_epoch, batch_size):
-            pairs = list(zip(chosen[start : start + batch_size], codes[start : start + batch_size]))
-            lr = np.stack([_augment(lr_pool[index], int(code)) for index, code in pairs])
-            hr = np.stack([_augment(hr_pool[index], int(code)) for index, code in pairs])
-            yield lr, hr
-    else:
-        for start in range(0, patches_per_epoch, batch_size):
-            indices = chosen[start : start + batch_size]
-            yield np.ascontiguousarray(lr_pool[indices]), np.ascontiguousarray(hr_pool[indices])
 
 
 def train_pilot_baseline(
@@ -149,8 +89,8 @@ def train_pilot_baseline(
 ) -> dict[str, Any]:
     """패치 풀로 베이스라인 ESPCN을 1시드 학습하고 마지막 에폭 체크포인트를 저장합니다.
 
-    에폭 배치는 `sample_epoch_batches`가 만든다. 학습 설정·시드·패치 풀이 잘못되면 체크포인트를 쓰기 전에
-    `ValueError`로 멈춘다.
+    에폭 배치는 공용 `SeededEpochPatchSampler`·`PatchPoolDataset`이 만든다. 학습 설정·시드·패치 풀이 잘못되면
+    체크포인트를 쓰기 전에 `ValueError`로 멈춘다.
 
     Returns:
         쓴 설정(`seed`, `epochs`, `patches_per_epoch`, `batch_size`, `learning_rate`, `optimizer`, `scheduler`,
@@ -158,8 +98,11 @@ def train_pilot_baseline(
         입력·저장 경로는 담지 않는다(Public 저장소).
     """
     _check_training_settings(epochs, patches_per_epoch, batch_size, learning_rate, optimizer, scheduler, augmentation)
-    data_rng = create_data_rng(seed)  # 시드 검증을 겸한다: 잘못된 시드는 대용량 풀을 읽기 전에 실패한다.
-    hr_pool, lr_pool, patch_pool_id = _load_pool(data_dir)
+    create_data_rng(seed)  # 시드 검증만 한다: 잘못된 시드는 대용량 풀을 읽기 전에 실패한다.
+    # 파일럿은 확정된 patch_pool_id가 아직 없어(null) 데이터가 알리는 ID를 그대로 쓴다. 본 실행은 구성의 값으로 검증한다.
+    patch_pool_id = read_patch_pool_id(data_dir)
+    dataset = PatchPoolDataset(data_dir, patch_pool_id)
+    sampler = SeededEpochPatchSampler(len(dataset), patches_per_epoch, seed, augmentation=augmentation)
 
     set_model_seed(seed)
     torch_device = torch.device(device)
@@ -170,11 +113,9 @@ def train_pilot_baseline(
     epoch_losses: list[float] = []
     started = time.perf_counter()
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
         loss_sum, patch_count = 0.0, 0
-        for lr_batch, hr_batch in sample_epoch_batches(
-            hr_pool, lr_pool, data_rng, patches_per_epoch, batch_size, augmentation=augmentation
-        ):
+        for lr_batch, hr_batch in dataset.iter_epoch_batches(sampler, epoch, batch_size):
             lr, hr = _to_tensor(lr_batch, torch_device), _to_tensor(hr_batch, torch_device)
             loss = loss_fn(model.forward_raw(lr), hr)
             torch_optimizer.zero_grad()
