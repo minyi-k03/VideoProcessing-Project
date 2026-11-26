@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import random
 
 import numpy as np
@@ -13,6 +14,9 @@ import torch
 # 시드에서 파생하는 난수 스트림의 번호. 번호가 다르면 같은 시드여도 서로 독립인 스트림이 된다.
 _MODEL_STREAM = 0
 _DATA_STREAM = 1
+
+# 결정적 알고리즘 모드에서 cuBLAS가 요구하는 작업 공간 설정(PyTorch 재현성 문서의 값).
+CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 
 
 def _check_seed(seed: int) -> None:
@@ -26,7 +30,11 @@ def set_model_seed(seed: int) -> None:
     """모델 가중치 초기화 및 학습 루프의 난수 시드를 고정합니다.
 
     파이썬 `random`, numpy 전역, torch(CPU·CUDA 전체)의 전역 난수를 시드에서 파생한 값으로 맞추고,
-    cuDNN을 결정적 모드로 둡니다(프로세스 전역 설정이며 복원하지 않습니다).
+    cuDNN을 결정적 모드로 두며 결정적 알고리즘을 강제합니다(프로세스 전역 설정이며 복원하지 않습니다).
+    결정적 알고리즘 강제는 GPU에서 같은 시드가 같은 결과를 내게 하려는 것입니다. 예를 들어 Sobel 에지 손실(A)의
+    복제 패딩 backward는 기본 구현이 atomicAdd라 실행마다 부동소수점 덧셈 순서가 달라졌습니다(T3.7 Colab 확인).
+    결정적 구현이 없는 연산을 만나면 조용히 넘어가지 않고 RuntimeError가 납니다.
+    cuBLAS 결정성에 필요한 `CUBLAS_WORKSPACE_CONFIG`는 사용자가 이미 정했다면 덮어쓰지 않습니다.
     데이터 샘플러 난수(`create_data_rng`)는 건드리지 않습니다.
 
     Raises:
@@ -34,6 +42,7 @@ def set_model_seed(seed: int) -> None:
         ValueError: 시드가 음수일 때.
     """
     _check_seed(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", CUBLAS_WORKSPACE_CONFIG)
     sequence = np.random.SeedSequence(seed, spawn_key=(_MODEL_STREAM,))
     derived = int(sequence.generate_state(1)[0])  # 32비트: random·numpy 전역 시드 범위에 맞춘다.
     random.seed(derived)
@@ -41,6 +50,7 @@ def set_model_seed(seed: int) -> None:
     torch.manual_seed(derived)  # CPU와 모든 CUDA 장치를 함께 시드한다.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
 
 
 def create_data_rng(seed: int) -> np.random.Generator:
