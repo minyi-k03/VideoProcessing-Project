@@ -121,6 +121,53 @@ class TestMeanStdDelta:
         assert _result(tables, "A", dataset="Set14")["delta"] == pytest.approx(1.0)
         assert _result(tables, "A", dataset="Set14")["mean"] == pytest.approx(21.0)
 
+    def test_all_negative_seed_deltas_are_a_consistent_direction(self) -> None:
+        rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("A", 0, 29.5), _row("A", 1, 29.8), _row("A", 2, 29.9)]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+        a = _result(tables, "A")
+        # 시드별 Δ = [-0.5, -0.2, -0.1] -> 평균 -0.2667, 표준편차 sqrt((0.0544+0.0044+0.0278)/2)=0.2082
+        assert a["delta"] == pytest.approx(-0.8 / 3)
+        assert a["delta_sign"] == "negative"
+        assert bool(a["delta_sign_consistent"]) is True
+        assert bool(a["delta_exceeds_seed_delta_std"]) is True
+
+    def test_single_seed_pair_gives_no_direction_judgement(self) -> None:
+        rows = [_row("baseline", 0, 30.0), _row("A", 0, 31.0)]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+        a = _result(tables, "A")
+        assert a["delta"] == pytest.approx(1.0)
+        assert a["delta_sign"] == "positive"  # 짝지은 시드별 Δ를 그대로 묘사할 뿐 판정이 아니다
+        assert math.isnan(a["std"]) and math.isnan(a["seed_delta_std"])
+        assert a["delta_sign_consistent"] is pd.NA
+        assert a["delta_exceeds_seed_delta_std"] is pd.NA
+
+    def test_direction_judgement_needs_every_expected_seed_paired(self) -> None:
+        # 시드 2가 빠진 A: 시드별 Δ [1.0, 1.2] 둘은 있지만 "3개 모두"를 판정할 수 없다.
+        rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("A", 0, 31.0), _row("A", 1, 31.2)]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+        a = _result(tables, "A")
+        assert a["seed_delta_std"] == pytest.approx(math.sqrt(0.02))
+        assert a["delta_sign_consistent"] is pd.NA
+        assert a["delta_exceeds_seed_delta_std"] is pd.NA
+
+    def test_numbers_trace_back_to_run_ids(self) -> None:
+        tables = compute_result_tables(_fake_records(), expected_seeds=SEEDS)
+        a = _result(tables, "A")
+        assert a["run_ids"] == "c0-A-s0,c0-A-s1,c0-A-s2"
+        assert a["baseline_run_ids"] == "c0-baseline-s0,c0-baseline-s1,c0-baseline-s2"
+        assert _result(tables, "baseline")["baseline_run_ids"] == ""
+
+        seed_deltas = tables["seed_deltas"]
+        got = seed_deltas[(seed_deltas.config_id == "A") & (seed_deltas.metric == "psnr_y")].sort_values("seed")
+        assert list(got["run_id"]) == ["c0-A-s0", "c0-A-s1", "c0-A-s2"]
+        assert list(got["baseline_run_id"]) == ["c0-baseline-s0", "c0-baseline-s1", "c0-baseline-s2"]
+
+    def test_bicubic_delta_traces_to_baseline_runs(self) -> None:
+        rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("bicubic", 0, 28.0)]
+        bic = _result(compute_result_tables(_frame(rows), expected_seeds=SEEDS), "bicubic")
+        assert bic["run_ids"] == "c0-bicubic-s0"
+        assert bic["baseline_run_ids"] == "c0-baseline-s0,c0-baseline-s1,c0-baseline-s2"
+
     def test_every_metric_is_aggregated(self) -> None:
         tables = compute_result_tables(_fake_records(), expected_seeds=SEEDS)
         assert set(tables["results"].metric) == set(METRICS)
@@ -177,6 +224,17 @@ class TestCompletenessAndDuplicates:
         assert math.isnan(bic["seed_delta_std"])
         assert bic["delta_sign"] == ""
 
+    def test_bicubic_with_incomplete_status_is_marked_incomplete(self) -> None:
+        rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("bicubic", 0, 28.0, status="incomplete")]
+        bic = _result(compute_result_tables(_frame(rows), expected_seeds=SEEDS), "bicubic")
+        assert bool(bic["is_complete"]) is False
+        assert bic["incomplete_seeds"] == "0"
+        assert bic["missing_seeds"] == ""
+
+    def test_empty_expected_seeds_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="expected_seeds"):
+            compute_result_tables(_fake_records(), expected_seeds=())
+
     def test_seed_outside_expected_seeds_is_rejected(self) -> None:
         rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("A", 7, 31.0)]
         with pytest.raises(ValueError, match="시드"):
@@ -205,6 +263,30 @@ class TestCompletenessAndDuplicates:
         rows = [_row("A", 0, 31.0, commit="c0"), _row("A", 0, 31.0, commit="c1")]
         with pytest.raises(ValueError, match="중복"):
             compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+
+
+class TestDirectFrameInput:
+    """CSV를 거치지 않고 DataFrame을 직접 넘겨도 결측 키가 groupby에서 조용히 사라지지 않아야 한다."""
+
+    @pytest.mark.parametrize("column", ["run_id", "config_id", "seed", "patch_pool_id", "dataset"])
+    def test_validate_unique_runs_rejects_missing_key(self, column: str) -> None:
+        rows = [_row("A", 0, 31.0, commit="c0"), _row("A", 0, 31.5, commit="c1")]
+        frame = _frame(rows).astype({column: object})
+        frame[column] = None
+        with pytest.raises(ValueError, match=column):
+            validate_unique_runs(frame)
+
+    def test_compute_rejects_missing_patch_pool(self) -> None:
+        rows = [_row("baseline", s, 30.0, pool=None) for s in SEEDS]
+        with pytest.raises(ValueError, match="patch_pool_id"):
+            compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+
+    @pytest.mark.parametrize("value", [math.nan, math.inf])
+    def test_compute_rejects_non_finite_metric(self, value: float) -> None:
+        frame = _fake_records()
+        frame.loc[0, "lpips"] = value
+        with pytest.raises(ValueError, match="lpips"):
+            compute_result_tables(frame, expected_seeds=SEEDS)
 
 
 class TestLoadRunRecords:
@@ -253,13 +335,83 @@ class TestLoadRunRecords:
         with pytest.raises(ValueError, match="c9-ghost-s0"):
             load_run_records(tmp_path)
 
-    @pytest.mark.parametrize("column", ["patch_pool_id", "dataset", "psnr_y"])
-    def test_rejects_blank_key_or_metric(self, tmp_path: Path, column: str) -> None:
+    def test_rejects_per_image_without_summary(self, tmp_path: Path) -> None:
+        self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
+        self._write_run(tmp_path, _row("A", 0, 31.0), [("im1", 31.0)])
+        (tmp_path / "c0-A-s0" / "summary.csv").unlink()
+        with pytest.raises(ValueError, match="summary"):
+            load_run_records(tmp_path)
+
+    @pytest.mark.parametrize("filename", ["summary.csv", "per_image.csv"])
+    def test_rejects_header_only_csv(self, tmp_path: Path, filename: str) -> None:
+        self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
+        path = tmp_path / "c0-baseline-s0" / filename
+        pd.read_csv(path).iloc[0:0].to_csv(path, index=False)
+        with pytest.raises(ValueError, match="행이 없습니다"):
+            load_run_records(tmp_path)
+
+    @pytest.mark.parametrize(
+        "column",
+        ["patch_pool_id", "dataset", "psnr_y", "commit", "switches", "params",
+         "infer_ms_net", "infer_ms_total", "train_minutes"],
+    )  # fmt: skip
+    def test_rejects_blank_required_value(self, tmp_path: Path, column: str) -> None:
         self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
         path = tmp_path / "c0-baseline-s0" / "summary.csv"
         pd.read_csv(path).assign(**{column: None}).to_csv(path, index=False)
         with pytest.raises(ValueError, match=column):
             load_run_records(tmp_path)
+
+    @pytest.mark.parametrize("column", ["patch_pool_id", "commit", "config_id"])
+    def test_rejects_whitespace_only_string(self, tmp_path: Path, column: str) -> None:
+        self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
+        path = tmp_path / "c0-baseline-s0" / "summary.csv"
+        pd.read_csv(path).assign(**{column: "   "}).to_csv(path, index=False)
+        with pytest.raises(ValueError, match=column):
+            load_run_records(tmp_path)
+
+    @pytest.mark.parametrize(
+        ("column", "value"),
+        [("psnr_y", "NaN"), ("lpips", "nan"), ("ssim_y", "inf"), ("params", "abc"), ("psnr_y_pre_rgb", "inf")],
+    )
+    def test_rejects_non_finite_or_non_numeric_summary_value(self, tmp_path: Path, column: str, value: str) -> None:
+        self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
+        path = tmp_path / "c0-baseline-s0" / "summary.csv"
+        pd.read_csv(path).assign(**{column: value}).to_csv(path, index=False)
+        with pytest.raises(ValueError, match=column):
+            load_run_records(tmp_path)
+
+    def test_rejects_non_finite_per_image_value(self, tmp_path: Path) -> None:
+        self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
+        path = tmp_path / "c0-baseline-s0" / "per_image.csv"
+        pd.read_csv(path).assign(edge_psnr="inf").to_csv(path, index=False)
+        with pytest.raises(ValueError, match="edge_psnr"):
+            load_run_records(tmp_path)
+
+    def test_reads_records_written_with_evaluator_record_fields(self, tmp_path: Path) -> None:
+        """evaluator가 쓰는 필드(SummaryRecord·PerImageRecord)와 집계가 읽는 필드가 어긋나지 않아야 한다."""
+        from dataclasses import asdict
+
+        from sr_pipeline.evaluation.evaluator import PerImageRecord, SummaryRecord
+
+        summary = SummaryRecord(
+            run_id="c0-B-s0", commit="c0", config_id="B", seed=0, patch_pool_id=POOL, switches="B", dataset="Set5",
+            psnr_y=30.0, ssim_y=0.9, psnr_rgb=28.0, edge_psnr=25.0, lpips=0.1, psnr_y_pre_rgb=30.1,
+            params=24800, infer_ms_net=1.0, infer_ms_total=2.0, train_minutes=30.0, status="complete",
+        )  # fmt: skip
+        per_image = PerImageRecord(
+            run_id="c0-B-s0", dataset="Set5", image_id="baby", psnr_y=30.0, ssim_y=0.9, psnr_rgb=28.0,
+            edge_psnr=25.0, lpips=0.1,
+        )  # fmt: skip
+        run_dir = tmp_path / "c0-B-s0"
+        run_dir.mkdir()
+        pd.DataFrame([asdict(summary)]).to_csv(run_dir / "summary.csv", index=False)
+        pd.DataFrame([asdict(per_image)]).to_csv(run_dir / "per_image.csv", index=False)
+
+        loaded_summary, loaded_per_image = load_run_records(tmp_path)
+        assert list(loaded_summary.columns) == list(asdict(summary))
+        assert list(loaded_per_image.columns) == list(asdict(per_image))
+        assert loaded_summary.psnr_y_pre_rgb.iloc[0] == pytest.approx(30.1)
 
     def test_numeric_looking_identifiers_stay_strings(self, tmp_path: Path) -> None:
         row = _row("baseline", 0, 30.0, commit="0123456", pool="1e5")
