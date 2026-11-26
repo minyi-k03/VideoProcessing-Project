@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import random
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -23,6 +24,11 @@ def _restore_global_random_state() -> Iterator[None]:
     torch_state = torch.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     cudnn_flags = (torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+    deterministic_mode = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    cublas_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
     yield
     random.setstate(python_state)
     np.random.set_state(numpy_state)
@@ -30,6 +36,11 @@ def _restore_global_random_state() -> Iterator[None]:
     if cuda_states is not None:
         torch.cuda.set_rng_state_all(cuda_states)
     torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = cudnn_flags
+    torch.use_deterministic_algorithms(deterministic_mode[0], warn_only=deterministic_mode[1])
+    if cublas_config is None:
+        os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+    else:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = cublas_config
 
 
 def _draw(rng: np.random.Generator) -> np.ndarray:
@@ -134,6 +145,24 @@ def test_model_seed_puts_cudnn_in_deterministic_mode() -> None:
     set_model_seed(0)
     assert torch.backends.cudnn.deterministic is True
     assert torch.backends.cudnn.benchmark is False
+
+
+def test_model_seed_enforces_deterministic_algorithms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """시작 상태와 무관하게 set_model_seed 뒤에는 결정적 알고리즘이 강제(strict)되고 cuBLAS 설정이 있다.
+    GPU에서 A(Sobel 에지 손실)의 복제 패딩 backward가 실행마다 달랐던 문제(T3.7 Colab)의 재발 방지 장치다."""
+    torch.use_deterministic_algorithms(False)
+    monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
+    set_model_seed(0)
+    assert torch.are_deterministic_algorithms_enabled() is True
+    assert torch.is_deterministic_algorithms_warn_only_enabled() is False
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
+
+
+def test_model_seed_keeps_user_cublas_workspace_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """사용자가 정한 CUBLAS_WORKSPACE_CONFIG는 덮어쓰지 않는다."""
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    set_model_seed(0)
+    assert os.environ["CUBLAS_WORKSPACE_CONFIG"] == ":16:8"
 
 
 def test_model_init_same_seed_gives_same_weights() -> None:
