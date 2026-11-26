@@ -60,11 +60,13 @@ def _edge_error_share(edge_psnr_y: pd.Series, flat_psnr_y: pd.Series, edge_fract
 
     에지·평탄 PSNR(Y)을 MSE로 되돌리고 영역 화소 비율로 가중한다. 에지 영역 화소 수는 ceil(q%·N)이라
     비율을 q%로 둔 이 값은 근사다(테스트셋 영상 크기에서 차이는 화소 1개 이하).
+    Y 오차가 0인 영상(에지·평탄 PSNR(Y) 모두 inf)은 비중이 정의되지 않아 NaN이다. 호출자가 평균에서 빼고 수를 센다.
     """
     edge_mse = PIXEL_MAX**2 / np.power(10.0, edge_psnr_y / 10.0)
     flat_mse = PIXEL_MAX**2 / np.power(10.0, flat_psnr_y / 10.0)
     edge_sum = edge_fraction * edge_mse
-    return edge_sum / (edge_sum + (1.0 - edge_fraction) * flat_mse)
+    total = edge_sum + (1.0 - edge_fraction) * flat_mse
+    return (edge_sum / total.where(total > 0)).astype(float)
 
 
 def compare_diagnoses(model_dir: Path, reference_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -80,6 +82,7 @@ def compare_diagnoses(model_dir: Path, reference_dir: Path) -> tuple[pd.DataFram
     - `win_rate_<열>`: 모델이 기준보다 나은 영상 비율. PSNR류는 클 때, `mse_cb`·`mse_cr`는 작을 때 이긴 것으로 센다.
     - `model_share_y`, `reference_share_y`: YCbCr 오차 중 Y 비중의 평균.
     - `model_edge_error_share`, `reference_edge_error_share`: Y 오차 중 에지 영역(HR Y Sobel 상위 q%) 비중의 평균.
+      Y 오차가 0인 영상은 비중이 정의되지 않아 평균에서 빼고, 뺀 수를 `<side>_edge_share_excluded`에 남긴다.
 
     함께 돌려주는 설정에는 맞춘 진단 설정과 두 진단의 `commit`이 있다.
     """
@@ -116,7 +119,9 @@ def compare_diagnoses(model_dir: Path, reference_dir: Path) -> tuple[pd.DataFram
             row[f"win_rate_{column}"] = float(better.mean())
         for side in ("model", "reference"):
             row[f"{side}_share_y"] = float(group[f"share_y_{side}"].mean())
-            row[f"{side}_edge_error_share"] = float(group[f"edge_error_share_{side}"].mean())
+            share = group[f"edge_error_share_{side}"]
+            row[f"{side}_edge_error_share"] = float(share.mean(skipna=True))
+            row[f"{side}_edge_share_excluded"] = int(share.isna().sum())
         rows.append(row)
 
     settings = {key: model_settings[key] for key in MATCHED_SETTINGS}

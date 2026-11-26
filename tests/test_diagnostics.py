@@ -635,3 +635,23 @@ def test_compare_rejects_duplicate_rows(tmp_path: Path) -> None:
     reference = _write_diagnosis(tmp_path / "reference", rows[:1])
     with pytest.raises(ValueError, match="여러 개"):
         compare_diagnoses(model, reference)
+
+
+def test_compare_excludes_error_free_images_from_edge_share_explicitly(tmp_path: Path) -> None:
+    """오차가 0인 영상(에지·평탄 PSNR(Y) 모두 inf)은 에지 비중이 정의되지 않으므로 평균에서 빼고, 뺀 수를 남긴다."""
+    model = _write_diagnosis(tmp_path / "model", [
+        {"dataset": "Set5", "image_id": "a", "psnr_y": math.inf, "edge_psnr_y": math.inf, "flat_psnr_y": math.inf},
+        {"dataset": "Set5", "image_id": "b", "edge_psnr_y": 32.0},  # 에지·평탄 MSE가 같음 → 비중 0.2
+    ])
+    reference = _write_diagnosis(tmp_path / "reference", [
+        {"dataset": "Set5", "image_id": "a", "edge_psnr_y": 32.0},
+        {"dataset": "Set5", "image_id": "b", "edge_psnr_y": 32.0},
+    ])
+    table, _ = compare_diagnoses(model, reference)
+    row = table.set_index("dataset").loc["Set5"]
+
+    assert row["model_edge_error_share"] == pytest.approx(0.2)
+    assert row["model_edge_share_excluded"] == 1
+    assert row["reference_edge_error_share"] == pytest.approx(0.2)
+    assert row["reference_edge_share_excluded"] == 0
+    assert not table.isna().any().any()
