@@ -582,7 +582,7 @@ def test_compare_reports_mean_delta_win_rate_and_edge_share(tmp_path: Path) -> N
     edge_4x = 32.0 - 10.0 * math.log10(4.0)  # 에지 MSE가 평탄의 4배 → 에지 비중 0.2·4/(0.2·4+0.8) = 0.5
     model = _write_diagnosis(tmp_path / "model", [
         {"dataset": "Set5", "image_id": "a", "psnr_y": 31.0, "flat_psnr_y": 31.0, "mse_cb": 0.5},
-        {"dataset": "Set5", "image_id": "b", "psnr_y": 29.0, "flat_psnr_y": 33.0, "mse_cb": 2.0},
+        {"dataset": "Set5", "image_id": "b", "psnr_y": 29.0, "flat_psnr_y": 33.0, "mse_cr": 2.0},
         {"dataset": "Set14", "image_id": "01", "edge_psnr_y": edge_4x},
     ])
     reference = _write_diagnosis(tmp_path / "reference", [
@@ -598,7 +598,8 @@ def test_compare_reports_mean_delta_win_rate_and_edge_share(tmp_path: Path) -> N
     assert set5["delta_psnr_y"] == pytest.approx(0.0)
     assert set5["win_rate_psnr_y"] == pytest.approx(0.5)
     assert set5["win_rate_flat_psnr_y"] == pytest.approx(0.5)
-    assert set5["win_rate_mse_cb"] == pytest.approx(0.5)  # mse는 작을 때 이긴다
+    assert set5["win_rate_mse_cb"] == pytest.approx(0.5)  # mse는 작을 때 이긴다(a만 작음, b는 같음)
+    assert set5["win_rate_mse_cr"] == pytest.approx(0.0)  # b는 더 크므로 진다
     assert set5["win_rate_edge_psnr_y"] == pytest.approx(0.0)  # 같으면 이긴 것이 아니다
     assert set5["reference_share_y"] == pytest.approx(0.75)
     set14 = table.set_index("dataset").loc["Set14"]
