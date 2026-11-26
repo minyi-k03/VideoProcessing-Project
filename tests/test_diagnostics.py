@@ -1,4 +1,4 @@
-"""진단 5종 바깥 동작 테스트 (SPEC.md US52~56, Task T2.3).
+"""진단 5종과 진단 비교의 바깥 동작 테스트 (SPEC.md US52~57, Task T2.3·T3.1).
 
 작은 합성 영상만 쓰므로 로컬 CPU에서 돈다. 공개 함수의 반환값과 저장 파일만 검증한다.
 """
@@ -21,6 +21,7 @@ import yaml
 from PIL import Image
 
 from sr_pipeline.common.color import rgb_to_y, rgb_to_ycbcr, ycbcr_to_rgb
+from sr_pipeline.diagnosis.compare import compare_diagnoses
 from sr_pipeline.diagnosis.diagnostics import (
     compute_edge_flat_psnr,
     compute_error_map,
@@ -561,3 +562,76 @@ def test_pilot_diagnosis_writes_nothing_when_settings_invalid(tmp_path: Path) ->
             tmp_path / "sr", tmp_path / "testsets", out, _fair_comparison(None), commit=COMMIT, edge_top_q=None
         )
     assert not out.exists()
+
+
+# ---------------------------------------------------------------- 진단 비교 (T3.1)
+
+
+def _write_diagnosis(directory: Path, rows: list[dict], **settings: object) -> Path:
+    directory.mkdir(parents=True)
+    base = {"psnr_y": 30.0, "edge_psnr_y": 25.0, "flat_psnr_y": 32.0, "mse_cb": 1.0, "mse_cr": 1.0, "share_y": 0.9,
+            "band_ratio_low": 1.0, "band_ratio_mid": 0.5, "band_ratio_high": 0.1}
+    pd.DataFrame([{**base, **row} for row in rows]).to_csv(directory / "per_image_diagnosis.csv", index=False)
+    record = {"edge_top_q": 20.0, "shave_border": 4, "datasets": ["Set5", "Set14"], "commit": directory.name, **settings}
+    (directory / "diagnosis_settings.json").write_text(json.dumps(record), encoding="utf-8")
+    return directory
+
+
+def test_compare_reports_mean_delta_win_rate_and_edge_share(tmp_path: Path) -> None:
+    """테스트셋별 평균 차이·이긴 비율·에지 오차 비중을 영상 단위로 맞대어 계산한다."""
+    edge_4x = 32.0 - 10.0 * math.log10(4.0)  # 에지 MSE가 평탄의 4배 → 에지 비중 0.2·4/(0.2·4+0.8) = 0.5
+    model = _write_diagnosis(tmp_path / "model", [
+        {"dataset": "Set5", "image_id": "a", "psnr_y": 31.0, "flat_psnr_y": 31.0, "mse_cb": 0.5},
+        {"dataset": "Set5", "image_id": "b", "psnr_y": 29.0, "flat_psnr_y": 33.0, "mse_cr": 2.0},
+        {"dataset": "Set14", "image_id": "01", "edge_psnr_y": edge_4x},
+    ])
+    reference = _write_diagnosis(tmp_path / "reference", [
+        {"dataset": "Set14", "image_id": "01", "edge_psnr_y": 32.0},
+        {"dataset": "Set5", "image_id": "b", "share_y": 0.7},
+        {"dataset": "Set5", "image_id": "a", "share_y": 0.8},
+    ])
+    table, settings = compare_diagnoses(model, reference)
+
+    assert list(table["dataset"]) == ["Set14", "Set5"]
+    set5 = table.set_index("dataset").loc["Set5"]
+    assert set5["n_images"] == 2
+    assert set5["delta_psnr_y"] == pytest.approx(0.0)
+    assert set5["win_rate_psnr_y"] == pytest.approx(0.5)
+    assert set5["win_rate_flat_psnr_y"] == pytest.approx(0.5)
+    assert set5["win_rate_mse_cb"] == pytest.approx(0.5)  # mse는 작을 때 이긴다(a만 작음, b는 같음)
+    assert set5["win_rate_mse_cr"] == pytest.approx(0.0)  # b는 더 크므로 진다
+    assert set5["win_rate_edge_psnr_y"] == pytest.approx(0.0)  # 같으면 이긴 것이 아니다
+    assert set5["reference_share_y"] == pytest.approx(0.75)
+    set14 = table.set_index("dataset").loc["Set14"]
+    assert set14["reference_edge_error_share"] == pytest.approx(0.2)  # 에지·평탄 MSE가 같으면 화소 비율 그대로
+    assert set14["model_edge_error_share"] == pytest.approx(0.5)
+    assert set14["delta_edge_psnr_y"] == pytest.approx(edge_4x - 32.0)
+    assert settings["edge_top_q"] == 20.0
+    assert (settings["model_diagnosis_commit"], settings["reference_diagnosis_commit"]) == ("model", "reference")
+
+
+@pytest.mark.parametrize("key, value", [("edge_top_q", 10.0), ("shave_border", 0), ("datasets", ["Set5"])])
+def test_compare_rejects_different_diagnosis_settings(tmp_path: Path, key: str, value: object) -> None:
+    """진단 설정이 다른 두 결과는 비교하지 않는다."""
+    rows = [{"dataset": "Set5", "image_id": "a"}]
+    model = _write_diagnosis(tmp_path / "model", rows)
+    reference = _write_diagnosis(tmp_path / "reference", rows, **{key: value})
+    with pytest.raises(ValueError, match=key):
+        compare_diagnoses(model, reference)
+
+
+def test_compare_rejects_different_image_sets(tmp_path: Path) -> None:
+    """한쪽에만 있는 영상이 있으면 비교하지 않는다."""
+    model = _write_diagnosis(tmp_path / "model", [{"dataset": "Set5", "image_id": "a"}, {"dataset": "Set5", "image_id": "b"}])
+    reference = _write_diagnosis(tmp_path / "reference", [{"dataset": "Set5", "image_id": "a"}])
+    with pytest.raises(ValueError, match="영상 집합"):
+        compare_diagnoses(model, reference)
+
+
+def test_compare_rejects_duplicate_rows(tmp_path: Path) -> None:
+    """같은 영상 행이 두 번 있으면(여러 실행이 섞인 결과) 비교하지 않는다."""
+    rows = [{"dataset": "Set5", "image_id": "a"}, {"dataset": "Set5", "image_id": "a"}]
+    model = _write_diagnosis(tmp_path / "model", rows)
+    reference = _write_diagnosis(tmp_path / "reference", rows[:1])
+    with pytest.raises(ValueError, match="여러 개"):
+        compare_diagnoses(model, reference)
