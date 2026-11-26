@@ -28,7 +28,7 @@
 - `data/sampler.py`·`dataset.py`의 샘플러가 구현되어 `tests/test_data_sampler.py`와 `tests/test_config_and_sampler.py`의 샘플러 테스트를 통과한다(T3.3 ⚠ 통과, main 병합은 차가원 승인 대기). `SeededEpochPatchSampler(pool_size, patches_per_epoch, seed, *, augmentation)`가 `create_data_rng`만으로 에폭마다 `(patch_idx, aug_code)`를 정하고, `epoch_plan(epoch)`은 에폭을 직접 지정해도 처음부터 순차로 돌린 것과 같다(T3.7 재개 대비). `PatchPoolDataset(data_dir, patch_pool_id)`는 풀 ID가 다르면 거부하고, 배율은 풀 `metadata.json`의 `scale`을 쓰며(없거나 잘못되면 거부, 모델 배율과의 대조는 호출자가 한다), `iter_epoch_batches`로 (LR, HR) 배치를 낸다. 난수 소비 순서는 T2.5 파일럿과 같다(테스트가 시드 0의 에폭 계획을 기준 값으로 고정하고, 리팩터링 전후 파일럿 학습의 손실·가중치가 합성 풀에서 비트 단위로 같음을 일회성 비교로 확인했다). `engine/pilot.py`는 이 공용 모듈을 쓰도록 바뀌었고 `sample_epoch_batches`는 사라졌다. `TestsetDataset`은 T3.6에서 구현한다.
 - `config/schema.py`가 구현되어 `tests/test_config_and_sampler.py`의 T3.2 테스트를 통과한다(T3.2 ⚠ 통과, main 병합은 차가원 승인 대기). `load_fair_comparison`은 구조(최상위 3절, 필수·알 수 없는 키, 고정 값의 `null`, `representative_images`의 데이터셋 집합)만 검증하고 `pilot_determined`의 `null`은 허용한다. `find_undetermined`가 `null`인 항목의 점 경로를 돌려주며 T4.2의 "`null` 0개" 확인에 쓴다. `load_experiment_config`는 `trainable`·`promoted_only`·`switches`(A·B·C·Bp, bool)만 받고, 공정 비교 조건 이름 키는 덮어쓰기 시도로 거부한다. `resolve_run_config`는 시드가 `fixed_rules.seeds`에 없거나 `pilot_determined`에 `null`이 남아 있으면 `ValueError`로 멈추므로, **T4.2 전에는 실제 `fair_comparison.yaml`로 확정 실행 조건을 만들 수 없다**(T3.7·T3.8 개발과 T3.9 e2e는 테스트 코드 안 합성 값으로 채운 fair 파일을 쓴다). 확정 실행 조건의 `fair_comparison`은 깊은 복사본이다. `diagnostics.py`·`pilot.py`의 자체 YAML 검증은 그대로 둔다.
 - `engine/trainer.py`가 구현되어 `tests/test_trainer.py`(로컬 CPU, 합성 패치 풀)를 통과한다(T3.7 통과: 로컬 CPU 테스트와 Colab T4 확인을 모두 통과, 확인용 노트북 `notebooks/t3_7_trainer_colab_check.ipynb` — 학습 구성 9개의 GPU 결정성, 재개 후 일치, 상한 `incomplete`). `train_run(run_config, data_dir, output_dir, checkpoint_dir, *, commit, resume, device, clock)`은 확정된 실행 조건으로 에폭 학습을 하고, 매 에폭 끝에 `<checkpoint_dir>/<run_id>/state.pt`(모델·옵티마이저·에폭 손실·누적 학습 시간·run_id·학습 설정 해시)를 원자적으로 저장하며 끝나면 마지막 에폭 가중치 `weights.pt`(평가 체크포인트)와 `<output_dir>/<run_id>/train_log.json`(`run_id`, `commit`, `config_id`, `seed`, `patch_pool_id`, `switches`, `params`, `status`, `epochs_done`, `epochs_total`, `train_minutes`, `epoch_losses` — 경로는 기록하지 않음)을 쓴다. 재개는 `resume=True`이고 run_id와 학습 설정 해시가 같을 때만 되며(런타임이 끊긴 뒤 재개한 가중치·손실이 한 번에 끝까지 돈 것과 비트 단위로 같음을 테스트가 확인), `resume=False`인데 같은 run_id의 `state.pt`·`weights.pt`·`train_log.json` 중 하나라도 있으면 거부한다. 커밋되지 않은 변경으로 시작한 `-dirty` 실행과 학습 없는 구성(bicubic)은 재개를 거부한다. `max_hours`(0보다 큰 유한한 수)와 `patch_size_hr`(패치 풀 HR 패치 크기와 일치, `PatchPoolDataset.hr_patch_size`로 확인)은 파일을 쓰기 전에 검증한다. 3시간 상한은 매 에폭 **시작 전** 누적 학습 시간으로 판정해(에폭 중간에는 끊지 않고, 마지막 에폭을 끝냈으면 `complete`) `incomplete`로 기록하며, 상한에 걸린 실행을 재개하면 더 학습하지 않고 같은 `incomplete`를 다시 기록한다. `build_model_and_loss`가 스위치를 모델·손실로 옮긴다(T3.5 항목의 대응; B와 Bp 동시 켜짐은 거부). `check_git_clean(repo_root, allow_dirty)`는 `diagnosis.provenance.resolve_code_commit`에 위임한다. `train_and_evaluate`는 커밋 확인 → 학습(bicubic은 건너뜀) → `evaluate_model(model|None, run_meta, data_dir, <output_dir>/<run_id>)`의 얇은 조합이며, 평가 자체는 T3.6이라 테스트에서는 평가기를 대체했다. 한계: 현재 패치 풀에는 학습 곡선 모니터링용 DIV2K 분할이 없어 학습 곡선은 학습 손실뿐이고, 옵티마이저·스케줄은 `adam`·`none`만 지원한다(T4.2가 다른 값을 고정하면 트레이너 확장 필요). 파일럿 경로(`engine/pilot.py`)는 이미 커밋된 결과를 낸 코드라 그대로 두었다. 다른 에이전트 교차 검증(중요 3·사소 2)을 반영했다. Colab T4 1차 확인(commit `909246c`, torch 2.14.1+cu130, Tesla T4): 확인 ③ 상한은 통과했고 ①②는 **A가 켜진 구성 4개(A, AB, AC, ABC)에서만 FAIL**(같은 시드 2회 가중치 최대 차이 1.3e-6~6.8e-5, 재개 후 3e-8~1.2e-4), baseline·B·C·Bp·BC는 비트 단위로 같았다. A의 Sobel 손실 복제 패딩 backward가 CUDA에서 비결정적인 것으로 추정되며(원인 연산은 따로 확정하지 않음), 결정적 알고리즘을 강제하면(진단 셀) 4개 모두 차이 0이고 경고도 없었다. 그래서 `common/seed.py`의 `set_model_seed`가 `torch.use_deterministic_algorithms(True)`(strict)와 `CUBLAS_WORKSPACE_CONFIG`(미지정 시 `:4096:8`)를 설정하도록 고쳤다(로컬 테스트 통과). Colab T4 재확인(commit `cd0c19a`, torch 2.14.1+cu130, CUDA 13.0, cuDNN 9.28, Tesla T4): ① 9개 구성 모두 같은 시드 2회 가중치·에폭 손실이 비트 단위로 같고 다른 시드는 다른 결과, ② 9개 구성 모두 2에폭 저장 뒤 끊고 재개한 결과가 한 번에 돈 결과와 비트 단위로 같음, ③ 상한 시 `incomplete`(1/3에폭)와 재개해도 추가 학습 없음 → 셀 7 전체 PASS. 참고: 결정적 알고리즘 적용 후 파일럿 규모(에폭당 10,000패치, 배치 16, HR 패치 96) 1에폭은 구성별 3.2~5.0초로, 3시간 상한에 약 2,200~3,400에폭이 들어간다(합성 데이터, T4.1·T4.2의 가늠용). 주의: strict 모드라서 평가·진단 코드를 같은 프로세스에서 CUDA로 돌릴 때 결정적 구현이 없는 연산이 있으면 오류가 날 수 있으니 T3.6·T3.8에서 확인한다.
-- T3.1 진단 분석으로 ADR-0004를 확정했다(차가원, accepted, main 병합은 고용민 승인 대기). 개선 A·B·C와 통제 구성 B′를 교체 없이 유지한다. 근거는 `scripts/compare_pilot_diagnosis.py`(`diagnosis/compare.py`의 `compare_diagnoses`)가 파일럿 베이스라인 진단과 Bicubic 하한 진단을 영상 단위로 비교해 만든 `results/pilot/baseline_vs_bicubic.csv`이고, ADR에는 방향만 적었다(ADR-0006). 두 진단의 `edge_top_q`·`shave_border`·`datasets`나 영상 집합이 다르면 비교를 거부한다. 파일럿 베이스라인은 짧게 학습했으므로 본 실행 베이스라인(T6.2)으로 같은 비교를 다시 돌려 방향을 확인한다. 3주차 개선별 담당은 제안 상태다(담당 표). 11/28 C 승격 조건 1(핵심 Ablation 시드 3개 완료)은 현재 일정으로는 만족하기 어려워 날짜 조정 여부를 팀이 정해야 한다.
+- T3.1 진단 분석으로 ADR-0004를 확정했다(차가원, accepted, PR #15로 main 병합 완료). 개선 A·B·C와 통제 구성 B′를 교체 없이 유지한다. 근거는 `scripts/compare_pilot_diagnosis.py`(`diagnosis/compare.py`의 `compare_diagnoses`)가 파일럿 베이스라인 진단과 Bicubic 하한 진단을 영상 단위로 비교해 만든 `results/pilot/baseline_vs_bicubic.csv`이고, ADR에는 방향만 적었다(ADR-0006). 두 진단의 `edge_top_q`·`shave_border`·`datasets`나 영상 집합이 다르면 비교를 거부한다. 파일럿 베이스라인은 짧게 학습했으므로 본 실행 베이스라인(T6.2)으로 같은 비교를 다시 돌려 방향을 확인한다. 3주차 개선별 담당은 제안 상태다(담당 표). C 승격 결정일은 일정 지연으로 11/28에서 12/1~12/2로 옮겼다(정확한 날짜는 T4.2 완료 시점에 정함, ADR-0004). 진단 비교는 Y 오차가 0인 영상을 에지 오차 비중 평균에서 빼고 그 수를 `<side>_edge_share_excluded`에 남긴다.
 - `common/color.py`는 구현되어 테스트를 통과한다(T1.1 통과, 11/15 main 병합 완료).
 - `common/bicubic.py`도 구현되어 로컬 CPU 테스트와 Colab 확인(CUDA 일치, BasicSR `imresize` 대조)을 통과한다(T1.2 통과, 11/15 main 병합 완료).
 - `common/seed.py`도 구현되어 로컬 CPU 테스트와 Colab T4 확인(CUDA 초기화·난수 재현, 데이터 수열 격리, cuDNN 결정적 모드, 작은 ESPCN형 모델 2회 학습 가중치 일치)을 통과한다(T1.3 통과, 11/15 main 병합 완료). 실제 학습 루프의 GPU 결정성과 재개 후 일치는 T3.7에서 다시 확인한다.
@@ -66,7 +66,7 @@
 | M4 | 11/18~19 | 파일럿·조건 고정 | `fair_comparison.yaml`에 `null` 없음 |
 | M5 | 11/20 | 제안 자료 제출 | 제출 완료 |
 | M6 | 11/20~27 | 핵심 Ablation | 18회 실행 기록이 main에 병합, 결과 표 자동 생성 |
-| M7 | 11/28 (~12/4) | 승격 결정·확장 실행 | 결정 기록, 승격 시 9회 추가 |
+| M7 | 12/1~12/2 (~12/4) | 승격 결정·확장 실행 | 결정 기록, 승격 시 9회 추가 |
 | M8 | **12/5** | **동결** | 집계 스냅샷 보존 |
 | M9 | ~12/9 | 데모 | 3분할 데모 동작 + 녹화 영상 |
 | M10 | 12/5~10 | 보고·발표 | 12/10 발표 |
@@ -145,7 +145,7 @@ x4 SR 개선 실험
 
 | ID | 작업 | 담당 | 선행 | US | 완료 조건 | 상태 |
 | --- | --- | --- | --- | --- | --- | --- |
-| T5.1 | 제안 자료: 진단 근거 → 개선 설계(강의 개념 연결), 실험 계획. 진단은 파일럿 베이스라인 기준이라고 명시 | 공통 | T3.1 | 83 | 제출 | 대기 |
+| T5.1 | 제안 자료: 진단 근거 → 개선 설계(강의 개념 연결), 실험 계획. 진단은 파일럿 베이스라인 기준이라고 명시 | 공통 | T3.1 | 83 | 제출 | 통과 |
 
 ### M6 핵심 실행 (11/20~27)
 
@@ -155,7 +155,7 @@ x4 SR 개선 실험
 | T6.2 | 베이스라인, +A, +B, +A+B, +C, B′ × 시드 {0,1,2} = 18회 실행. 이름 브랜치 커밋 → PR → main 병합. 상대 변경 병합 시 즉시 반영 후 다음 실행 | 개선별 | T4.2 | 27, 31, 73 | 18회 모두 `complete`로 main에 병합 | 대기 |
 | T6.3 | 집계 산출물: 결과 표, Ablation 표(A: RGB·Y 맥락, B: 정렬·입력/용량 분해), BSD100·Urban100 영상별 Δ 분포, 성공·실패 사례 자동 선정, 다중 구성 비교 그림·오차 지도, 학습 시간 표·학습 곡선, 구성×시드 진행 현황 표 | 고용민 | T4.3 | 60–61, 63–66, 76, 84 | 표·그림 파일이 `results/aggregated/`에 자동 생성 | 대기 |
 
-### M7 승격 결정 (11/28, 확장 실행 ~12/4)
+### M7 승격 결정 (12/1~12/2, 확장 실행 ~12/4)
 
 | ID | 작업 | 담당 | 선행 | US | 완료 조건 | 상태 |
 | --- | --- | --- | --- | --- | --- | --- |
