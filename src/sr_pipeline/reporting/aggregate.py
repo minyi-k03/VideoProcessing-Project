@@ -4,7 +4,7 @@
 - main에 병합된 실행 기록(`results/runs/`)만 입력으로 사용
 - `(config_id, seed, patch_pool_id)` 중복 감지 시 오류
 - 시드 3개 미만 또는 `incomplete` 포함 구성은 "미완료" 표시
-- 평균 ± 표준편차, 베이스라인 대비 Δ, 시드별 Δ 부호 일관성, |mean Δ| > std(seed Δ) 판정
+- 평균 ± 표준편차, 베이스라인 대비 Δ, 시드별 Δ 부호 일관성, 부호 있는 평균 Δ > std(seed Δ) 판정
 - Ablation 표(A: RGB·Y 맥락, B: 정렬 B′·입력/용량 B 분해), 영상별 Δ 분포, 사례 영상 자동 선정
 
 이 파일의 구현 범위(T4.3 집계 핵심): `load_run_records`, `validate_unique_runs`, `compute_result_tables`.
@@ -42,6 +42,7 @@ _STRING_COLUMNS = ("run_id", "commit", "config_id", "patch_pool_id", "switches",
 _SUMMARY_STRINGS = ("run_id", "commit", "config_id", "patch_pool_id", "switches", "dataset", "status")
 _SUMMARY_NUMBERS = ("seed", *METRICS, "params", "infer_ms_net", "infer_ms_total", "train_minutes")
 _SUMMARY_OPTIONAL_NUMBERS = ("psnr_y_pre_rgb",)
+_PSNR_COLUMNS = frozenset({"psnr_y", "psnr_rgb", "edge_psnr", "psnr_y_pre_rgb"})
 _SUMMARY_INTEGERS = ("seed", "params")
 _PER_IMAGE_STRINGS = ("run_id", "dataset", "image_id")
 _KEY_COLUMNS = ("run_id", *_RUN_KEY, "dataset")
@@ -51,7 +52,7 @@ _RESULT_COLUMNS = [
     "n_seeds", "seeds", "mean", "std", "delta",
     "seed_delta_std", "delta_sign", "delta_sign_consistent", "delta_exceeds_seed_delta_std",
     "is_complete", "missing_seeds", "incomplete_seeds", "baseline_is_complete",
-    "run_ids", "baseline_run_ids",
+    "run_ids", "incomplete_run_ids", "baseline_run_ids",
 ]  # fmt: skip
 _SEED_DELTA_COLUMNS = [*_GROUP_KEY, "metric", "seed", "delta", "run_id", "baseline_run_id"]
 
@@ -76,26 +77,44 @@ def _check_no_blanks(df: pd.DataFrame, columns: Sequence[str], source: object) -
         raise ValueError(f"{source}에 빈 값이 있는 필수 열이 있습니다: {blank}")
 
 
-def _as_finite_numbers(
-    df: pd.DataFrame, required: Sequence[str], source: object, *, optional: Sequence[str] = ()
+def _check_statuses(df: pd.DataFrame, source: object) -> None:
+    _check_no_blanks(df, ("status",), source)
+    bad = sorted(set(df["status"]) - set(_STATUSES))
+    if bad:
+        raise ValueError(f"{source}의 status는 {_STATUSES} 중 하나여야 합니다: {bad}")
+
+
+def _as_valid_numbers(
+    df: pd.DataFrame,
+    required: Sequence[str],
+    source: object,
+    *,
+    optional: Sequence[str] = (),
+    allow_posinf: Iterable[str] = (),
 ) -> pd.DataFrame:
-    """수치 열을 float로 바꾼 사본을 돌려준다. "NaN"·"inf"·숫자가 아닌 값은 평균을 오염시키므로 거부한다.
+    """수치 열을 float로 바꾼 사본을 돌려준다.
 
     `optional` 열만 빈 값을 허용한다(빈 값은 NaN으로 남긴다).
+    `allow_posinf`에 포함된 PSNR 계열 열은 오차 0에서 평가기가 기록하는 양의 무한대(`+inf`)를 허용하고,
+    그 밖의 `NaN`·`-inf`·`+inf`·숫자가 아닌 값은 거부한다.
     """
     df = df.copy()
+    posinf_allowed = frozenset(allow_posinf)
     bad: list[str] = []
     for column in (*required, *optional):
         blank = _is_blank(df[column])
         values = pd.to_numeric(df[column].where(~blank), errors="coerce").astype(float)
-        invalid = ~blank & ~np.isfinite(values)
+        valid_num = np.isfinite(values)
+        if column in posinf_allowed:
+            valid_num = valid_num | np.isposinf(values)
+        invalid = ~blank & ~valid_num
         if column in required:
             invalid |= blank
         if invalid.any():
             bad.append(column)
         df[column] = values
     if bad:
-        raise ValueError(f"{source}에 빈 값이거나 유한한 숫자가 아닌 값이 있는 열이 있습니다: {bad}")
+        raise ValueError(f"{source}에 빈 값이거나 허용되지 않은 숫자가 있는 열이 있습니다: {bad}")
     return df
 
 
@@ -109,9 +128,10 @@ def load_run_records(runs_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """`runs_dir/<run_id>/{summary,per_image}.csv`를 모두 읽어 (summary, per_image)로 합칩니다.
 
     실행 폴더에 두 파일 중 하나라도 없거나, 파일에 행이 없거나, 필요한 열이 없거나,
-    필수 값이 비었거나(빈 값은 `psnr_y_pre_rgb`만 허용), 수치가 유한한 숫자가 아니거나,
-    `status`가 알 수 없는 값이면 집계 전에 `ValueError`로 멈춘다. 중복 검사는 `validate_unique_runs`가 한다.
-    "main에 병합된 기록만"이라는 조건은 호출자가 `runs_dir`을 main 체크아웃에서 가리켜 지킨다(여기서 확인하지 않음).
+    필수 값이 비었거나(빈 값은 `psnr_y_pre_rgb`만 허용), 허용되지 않은 수치(`+inf`는 PSNR 계열 열만 허용,
+    `NaN`·`-inf`·비숫자는 모두 거부)가 있거나, `status`가 알 수 없는 값이면 집계 전에 `ValueError`로 멈춘다.
+    중복 검사는 `validate_unique_runs`가 한다.
+    "main에 병합된 기록만"이라는 조건은 T6.3 집계 스크립트(`scripts/aggregate_results.py`)에서 검증한다.
     """
     runs_dir = Path(runs_dir)
     run_dirs = (
@@ -136,21 +156,25 @@ def load_run_records(runs_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         _check_columns(per_image, _PER_IMAGE_COLUMNS, per_image_path)
         _check_no_blanks(summary, _SUMMARY_STRINGS, summary_path)
         _check_no_blanks(per_image, _PER_IMAGE_STRINGS, per_image_path)
-        summary = _as_finite_numbers(summary, _SUMMARY_NUMBERS, summary_path, optional=_SUMMARY_OPTIONAL_NUMBERS)
+        summary = _as_valid_numbers(
+            summary,
+            _SUMMARY_NUMBERS,
+            summary_path,
+            optional=_SUMMARY_OPTIONAL_NUMBERS,
+            allow_posinf=_PSNR_COLUMNS,
+        )
         fractional = [c for c in _SUMMARY_INTEGERS if (summary[c] % 1 != 0).any()]
         if fractional:
             raise ValueError(f"{summary_path}의 정수 열에 소수가 있습니다: {fractional}")
         summary = summary.astype({c: int for c in _SUMMARY_INTEGERS})
-        per_image = _as_finite_numbers(per_image, METRICS, per_image_path)
+        per_image = _as_valid_numbers(per_image, METRICS, per_image_path, allow_posinf=_PSNR_COLUMNS)
         summaries.append(summary[list(_SUMMARY_COLUMNS)])
         per_images.append(per_image[list(_PER_IMAGE_COLUMNS)])
 
     summary_df = pd.concat(summaries, ignore_index=True)
     per_image_df = pd.concat(per_images, ignore_index=True)
 
-    bad = sorted(set(summary_df["status"]) - set(_STATUSES))
-    if bad:
-        raise ValueError(f"summary의 status는 {_STATUSES} 중 하나여야 합니다: {bad}")
+    _check_statuses(summary_df, "summary")
     orphan = sorted(set(per_image_df["run_id"]) - set(summary_df["run_id"]))
     if orphan:
         raise ValueError(f"summary에 없는 실행의 per_image 기록이 있습니다: {orphan}")
@@ -182,8 +206,10 @@ def validate_unique_runs(summary_df: pd.DataFrame) -> None:
 
 
 def _sample_std(values: Sequence[float]) -> float:
-    """표본 표준편차(ddof=1). 값이 2개 미만이면 정의되지 않아 NaN."""
-    return float(np.std(values, ddof=1)) if len(values) >= 2 else math.nan
+    """표본 표준편차(ddof=1). 값이 2개 미만이거나 유한하지 않은 값(inf·NaN)이 있으면 정의되지 않아 NaN."""
+    if len(values) < 2 or not all(math.isfinite(v) for v in values):
+        return math.nan
+    return float(np.std(values, ddof=1))
 
 
 def _join_sorted(items: Iterable[Any]) -> str:
@@ -191,8 +217,8 @@ def _join_sorted(items: Iterable[Any]) -> str:
 
 
 def _delta_sign(seed_deltas: Sequence[float]) -> str:
-    """모두 양수 `positive`, 모두 음수 `negative`, 그 외(0 포함) `mixed`, 짝이 없으면 빈 문자열."""
-    if not seed_deltas:
+    """모두 양수 `positive`, 모두 음수 `negative`, 그 외(0 포함) `mixed`, 짝이 없거나 NaN이 있으면 빈 문자열."""
+    if not seed_deltas or any(math.isnan(d) for d in seed_deltas):
         return ""
     if all(d > 0 for d in seed_deltas):
         return "positive"
@@ -207,29 +233,32 @@ def compute_result_tables(summary_df: pd.DataFrame, *, expected_seeds: Sequence[
     `expected_seeds`는 `fair_comparison.yaml`의 `fixed_rules.seeds`를 호출자가 넘긴다(기본값 없음).
     (패치 풀, 테스트셋, 구성, 지표)마다 한 행인 `results`와, 시드별 Δ를 모두 담은 `seed_deltas`를 돌려준다.
 
-    - `std`·`seed_delta_std`: 표본 표준편차(ddof=1), 값이 2개 미만이면 NaN.
-    - `delta`: 같은 패치 풀·테스트셋·지표에서 (구성의 시드 평균) − (베이스라인의 시드 평균).
-      베이스라인 자신, 베이스라인이 없는 경우는 NaN.
-    - `delta_sign`: 같은 시드끼리 짝지은 시드별 Δ가 모두 양수면 `positive`, 모두 음수면 `negative`,
-      그 외(0 포함)는 `mixed`. 짝지은 시드별 Δ를 묘사할 뿐이며, 짝이 하나뿐이어도 채운다.
-      베이스라인·Bicubic 하한·짝지을 시드가 없으면 빈 문자열.
-    - `delta_sign_consistent`, `delta_exceeds_seed_delta_std`: SPEC의 "시드별 Δ 부호가 3개 모두 같은가",
-      "평균 Δ가 시드별 Δ의 표준편차보다 큰가" 판정. 기대 시드가 **모두** 베이스라인과 짝지어졌을 때만
-      값을 내고, 하나라도 빠지면 `<NA>`다(짝 1~2개로 "방향이 일관된다"고 말하지 않기 위함).
-      두 번째 판정의 좌변은 |시드별 Δ의 평균|이다. 기대 시드가 모두 짝지어지면 이 값은 `delta`와 같고,
-      절댓값이므로 낮을수록 좋은 LPIPS에도 같은 식으로 크기를 비교한다.
+    - 완료 실행만 수치에 포함(SPEC US20): `status=incomplete`(3시간 상한 중단 등) 실행은 `mean`·`std`·`delta`·
+      시드 짝짓기에서 제외하고, `is_complete=False`와 `incomplete_seeds`·`incomplete_run_ids`에만 남긴다.
+    - `std`·`seed_delta_std`: 표본 표준편차(ddof=1), 값이 2개 미만이거나 `+inf` 등으로 정의되지 않으면 NaN.
+    - `delta`: 같은 패치 풀·테스트셋·지표에서 (구성의 완료 시드 평균) − (베이스라인의 완료 시드 평균).
+      베이스라인 자신, 완료 실행이 없거나 완료 베이스라인이 없는 경우는 NaN. `inf - inf`도 NaN.
+    - `delta_sign`: 같은 완료 시드끼리 짝지은 시드별 Δ가 모두 양수면 `positive`, 모두 음수면 `negative`,
+      그 외(0 포함)는 `mixed`. 짝이 없거나 `inf - inf` 등 NaN이 섞이면 빈 문자열(판정 불가).
+      베이스라인·Bicubic 하한·짝지을 완료 시드가 없으면 빈 문자열.
+    - `delta_sign_consistent`, `delta_exceeds_seed_delta_std`: SPEC US59·ADR-0003의 "시드별 Δ 부호가 3개 모두
+      같은가", "평균 Δ가 시드별 Δ의 표준편차보다 큰가" 판정. 기대 시드가 **모두** 완료 실행으로 베이스라인과
+      짝지어졌을 때만 값을 내고, 하나라도 빠지거나 Δ·표준편차가 정의되지 않으면 `<NA>`다.
+      두 번째 판정은 SPEC·ADR 문구대로 부호 있는 평균 Δ(`mean(seed_deltas) > seed_delta_std`)를 비교한다
+      (낮을수록 좋은 LPIPS의 해석은 T6.3 보고서 표에서 따로 다룬다).
     - `is_complete`: 기대 시드가 모두 있고 모두 `status=complete`. Bicubic 하한은 시드 하나면 충분하다.
     - `baseline_is_complete`: 같은 패치 풀·테스트셋의 베이스라인이 완료인지(Δ의 기준이 미완료인지 알리기 위함).
-    - `run_ids`·`baseline_run_ids`(`seed_deltas`에서는 `run_id`·`baseline_run_id`): 그 수치를 만든 실행 ID
-      (ADR-0006 추적성). 쉼표로 이은 정렬 목록이며, Δ가 없는 행의 `baseline_run_ids`는 빈 문자열이다.
+    - `run_ids`·`baseline_run_ids`(`seed_deltas`에서는 `run_id`·`baseline_run_id`): 그 수치를 만든 완료 실행 ID
+      (ADR-0006 추적성). `incomplete_run_ids`는 미완료 실행 ID(진행 현황용). Δ가 없는 행의 `baseline_run_ids`는 빈 문자열이다.
 
-    `load_run_records`를 거치지 않은 DataFrame도 받으므로, 키 열 결측과 유한하지 않은 지표 값은 여기서도 거부한다.
+    `load_run_records`를 거치지 않은 DataFrame도 받으므로, 키 열 결측·`status`·허용되지 않은 지표 값은 여기서도 거부한다.
     """
     expected = sorted(set(int(s) for s in expected_seeds))
     if not expected:
         raise ValueError("expected_seeds가 비어 있습니다.")
     validate_unique_runs(summary_df)
-    summary_df = _as_finite_numbers(summary_df, METRICS, "summary_df")
+    _check_statuses(summary_df, "summary_df")
+    summary_df = _as_valid_numbers(summary_df, METRICS, "summary_df", allow_posinf=_PSNR_COLUMNS)
     unexpected = sorted(set(int(s) for s in summary_df["seed"]) - set(expected))
     if unexpected:
         raise ValueError(f"fair_comparison의 시드 {expected}에 없는 시드가 있습니다: {unexpected}")
@@ -238,39 +267,49 @@ def compute_result_tables(summary_df: pd.DataFrame, *, expected_seeds: Sequence[
     seed_delta_rows: list[dict[str, Any]] = []
 
     for (pool, dataset), block in summary_df.groupby(["patch_pool_id", "dataset"]):
-        baseline = block[block["config_id"] == BASELINE_CONFIG_ID].set_index("seed")
+        baseline_all = block[block["config_id"] == BASELINE_CONFIG_ID]
+        baseline_complete_rows = baseline_all[baseline_all["status"] == "complete"].set_index("seed")
         baseline_complete = None
-        if len(baseline):
-            baseline_complete, _, _ = _is_complete(baseline.reset_index(), expected, trainable=True)
+        if len(baseline_all):
+            baseline_complete, _, _ = _is_complete(baseline_all, expected, trainable=True)
 
         for config_id, config_rows in block.groupby("config_id"):
             trainable = config_id != BICUBIC_CONFIG_ID
             complete, missing, incomplete = _is_complete(config_rows, expected, trainable=trainable)
-            has_delta = config_id != BASELINE_CONFIG_ID and len(baseline) > 0
+            complete_rows = config_rows[config_rows["status"] == "complete"]
+            incomplete_rows = config_rows[config_rows["status"] != "complete"]
+            by_seed = complete_rows.set_index("seed")
+            has_delta = config_id != BASELINE_CONFIG_ID and len(baseline_complete_rows) > 0 and len(by_seed) > 0
             paired_by_seed = trainable and has_delta
-            by_seed = config_rows.set_index("seed")
-            paired = sorted(set(by_seed.index) & set(baseline.index)) if paired_by_seed else []
+            paired = sorted(set(by_seed.index) & set(baseline_complete_rows.index)) if paired_by_seed else []
             all_seeds_paired = paired == expected
 
             for metric in METRICS:
                 values = list(by_seed[metric])
-                mean = float(np.mean(values))
-                delta = mean - float(baseline[metric].mean()) if has_delta else math.nan
-                seed_deltas = [float(by_seed.at[s, metric] - baseline.at[s, metric]) for s in paired]
+                mean = float(np.mean(values)) if values else math.nan
+                baseline_mean = (
+                    float(np.mean(list(baseline_complete_rows[metric]))) if has_delta else math.nan
+                )
+                delta = (mean - baseline_mean) if has_delta else math.nan
+                seed_deltas = [
+                    float(by_seed.at[s, metric]) - float(baseline_complete_rows.at[s, metric]) for s in paired
+                ]
                 for s, d in zip(paired, seed_deltas):
                     seed_delta_rows.append(
                         {"patch_pool_id": pool, "dataset": dataset, "config_id": config_id, "metric": metric,
                          "seed": int(s), "delta": d,
-                         "run_id": by_seed.at[s, "run_id"], "baseline_run_id": baseline.at[s, "run_id"]}
+                         "run_id": by_seed.at[s, "run_id"], "baseline_run_id": baseline_complete_rows.at[s, "run_id"]}
                     )  # fmt: skip
                 sign = _delta_sign(seed_deltas)
                 seed_delta_std = _sample_std(seed_deltas)
                 consistent: Any = pd.NA
                 exceeds: Any = pd.NA
-                if all_seeds_paired:
+                if all_seeds_paired and sign != "":
                     consistent = sign != "mixed"
                     if not math.isnan(seed_delta_std):
-                        exceeds = abs(float(np.mean(seed_deltas))) > seed_delta_std
+                        mean_seed_delta = float(np.mean(seed_deltas))
+                        if math.isfinite(mean_seed_delta):
+                            exceeds = mean_seed_delta > seed_delta_std
 
                 result_rows.append(
                     {
@@ -283,7 +322,8 @@ def compute_result_tables(summary_df: pd.DataFrame, *, expected_seeds: Sequence[
                         "incomplete_seeds": _join_sorted(incomplete),
                         "baseline_is_complete": baseline_complete if baseline_complete is not None else pd.NA,
                         "run_ids": _join_sorted(by_seed["run_id"]),
-                        "baseline_run_ids": _join_sorted(baseline["run_id"]) if has_delta else "",
+                        "incomplete_run_ids": _join_sorted(incomplete_rows["run_id"]),
+                        "baseline_run_ids": _join_sorted(baseline_complete_rows["run_id"]) if has_delta else "",
                     }
                 )  # fmt: skip
 

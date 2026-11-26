@@ -121,15 +121,53 @@ class TestMeanStdDelta:
         assert _result(tables, "A", dataset="Set14")["delta"] == pytest.approx(1.0)
         assert _result(tables, "A", dataset="Set14")["mean"] == pytest.approx(21.0)
 
-    def test_all_negative_seed_deltas_are_a_consistent_direction(self) -> None:
+    def test_all_negative_seed_deltas_are_consistent_but_signed_mean_does_not_exceed_std(self) -> None:
         rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("A", 0, 29.5), _row("A", 1, 29.8), _row("A", 2, 29.9)]
         tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
         a = _result(tables, "A")
-        # 시드별 Δ = [-0.5, -0.2, -0.1] -> 평균 -0.2667, 표준편차 sqrt((0.0544+0.0044+0.0278)/2)=0.2082
+        # 시드별 Δ = [-0.5, -0.2, -0.1] -> 부호 모두 음수(consistent=True), 부호 있는 평균 -0.2667 <= std 0.2082 (False)
         assert a["delta"] == pytest.approx(-0.8 / 3)
         assert a["delta_sign"] == "negative"
         assert bool(a["delta_sign_consistent"]) is True
-        assert bool(a["delta_exceeds_seed_delta_std"]) is True
+        assert bool(a["delta_exceeds_seed_delta_std"]) is False
+
+    def test_uniform_negative_seed_deltas_yield_false_for_signed_mean_vs_std(self) -> None:
+        # 세 시드 PSNR(Y) Δ가 모두 -1이면 평균 -1, 표준편차 0 -> 부호 있는 평균 Δ > std는 False (SPEC US59·ADR-0003)
+        rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("A", s, 29.0) for s in SEEDS]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+        a = _result(tables, "A")
+        assert a["delta"] == pytest.approx(-1.0)
+        assert a["seed_delta_std"] == pytest.approx(0.0)
+        assert a["delta_sign"] == "negative"
+        assert bool(a["delta_sign_consistent"]) is True
+        assert bool(a["delta_exceeds_seed_delta_std"]) is False
+
+    def test_positive_inf_psnr_marks_undefined_std_and_delta_as_unjudgable(self) -> None:
+        # 평탄 합성 영상 등에서 PSNR이 정상적으로 +inf인 경우:
+        # (1) 구성과 베이스라인이 모두 +inf -> delta=NaN, std=NaN, 부호·판정 모두 판정 불가(<NA>)
+        # (2) 구성만 +inf, 베이스라인은 유한 -> mean=+inf, delta=+inf, std=NaN, 부호는 positive이나 평균 Δ vs std 판정은 <NA>
+        rows = [_row("baseline", s, math.inf) for s in SEEDS] + [_row("A", s, math.inf) for s in SEEDS]
+        rows += [_row("baseline", s, 30.0, dataset="Set14") for s in SEEDS]
+        rows += [_row("A", s, math.inf, dataset="Set14") for s in SEEDS]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+
+        both_inf = _result(tables, "A", dataset="Set5")
+        assert math.isinf(both_inf["mean"]) and both_inf["mean"] > 0
+        assert math.isnan(both_inf["std"])
+        assert math.isnan(both_inf["delta"])
+        assert math.isnan(both_inf["seed_delta_std"])
+        assert both_inf["delta_sign"] == ""
+        assert both_inf["delta_sign_consistent"] is pd.NA
+        assert both_inf["delta_exceeds_seed_delta_std"] is pd.NA
+
+        config_inf = _result(tables, "A", dataset="Set14")
+        assert math.isinf(config_inf["mean"]) and config_inf["mean"] > 0
+        assert math.isnan(config_inf["std"])
+        assert math.isinf(config_inf["delta"]) and config_inf["delta"] > 0
+        assert math.isnan(config_inf["seed_delta_std"])
+        assert config_inf["delta_sign"] == "positive"
+        assert bool(config_inf["delta_sign_consistent"]) is True
+        assert config_inf["delta_exceeds_seed_delta_std"] is pd.NA
 
     def test_single_seed_pair_gives_no_direction_judgement(self) -> None:
         rows = [_row("baseline", 0, 30.0), _row("A", 0, 31.0)]
@@ -200,14 +238,62 @@ class TestCompletenessAndDuplicates:
         assert a["n_seeds"] == 2
         assert bool(_result(tables, "baseline")["is_complete"]) is True
 
-    def test_incomplete_status_run_is_marked_incomplete(self) -> None:
+    def test_incomplete_status_run_is_excluded_from_metrics_and_tracked_separately(self) -> None:
+        # 완료 시드 둘과 베이스라인이 30이고 미완료 시드 하나가 50이면, 평균·Δ·시드 짝짓기는 완료 시드만 쓴다(SPEC US20).
         rows = [_row("baseline", s, 30.0) for s in SEEDS]
-        rows += [_row("A", 0, 31.0), _row("A", 1, 31.0, status="incomplete"), _row("A", 2, 31.0)]
+        rows += [_row("A", 0, 30.0), _row("A", 1, 50.0, status="incomplete"), _row("A", 2, 30.0)]
         tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
         a = _result(tables, "A")
         assert bool(a["is_complete"]) is False
         assert a["missing_seeds"] == ""
         assert a["incomplete_seeds"] == "1"
+        assert a["n_seeds"] == 2
+        assert a["seeds"] == "0,2"
+        assert a["mean"] == pytest.approx(30.0)
+        assert a["std"] == pytest.approx(0.0)
+        assert a["delta"] == pytest.approx(0.0)
+        assert a["run_ids"] == "c0-A-s0,c0-A-s2"
+        assert a["incomplete_run_ids"] == "c0-A-s1"
+        assert a["baseline_run_ids"] == "c0-baseline-s0,c0-baseline-s1,c0-baseline-s2"
+        assert a["delta_sign_consistent"] is pd.NA
+        assert a["delta_exceeds_seed_delta_std"] is pd.NA
+
+        paired_seeds = sorted(
+            tables["seed_deltas"][(tables["seed_deltas"].config_id == "A") & (tables["seed_deltas"].metric == "psnr_y")][
+                "seed"
+            ]
+        )
+        assert paired_seeds == [0, 2]
+
+    def test_incomplete_baseline_run_is_excluded_from_delta_and_pairing(self) -> None:
+        rows = [_row("baseline", 0, 30.0), _row("baseline", 1, 50.0, status="incomplete"), _row("baseline", 2, 30.0)]
+        rows += [_row("A", s, 31.0) for s in SEEDS]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+        base = _result(tables, "baseline")
+        a = _result(tables, "A")
+        assert bool(base["is_complete"]) is False
+        assert base["mean"] == pytest.approx(30.0)
+        assert base["run_ids"] == "c0-baseline-s0,c0-baseline-s2"
+        assert base["incomplete_run_ids"] == "c0-baseline-s1"
+        assert bool(a["baseline_is_complete"]) is False
+        assert a["delta"] == pytest.approx(1.0)
+        assert a["baseline_run_ids"] == "c0-baseline-s0,c0-baseline-s2"
+        assert a["delta_sign_consistent"] is pd.NA
+        assert a["delta_exceeds_seed_delta_std"] is pd.NA
+
+    def test_config_with_only_incomplete_runs_has_no_metrics_or_delta(self) -> None:
+        rows = [_row("baseline", s, 30.0) for s in SEEDS] + [_row("A", 0, 50.0, status="incomplete")]
+        tables = compute_result_tables(_frame(rows), expected_seeds=SEEDS)
+        a = _result(tables, "A")
+        assert bool(a["is_complete"]) is False
+        assert a["n_seeds"] == 0
+        assert a["seeds"] == ""
+        assert math.isnan(a["mean"]) and math.isnan(a["std"]) and math.isnan(a["delta"])
+        assert a["run_ids"] == ""
+        assert a["incomplete_run_ids"] == "c0-A-s0"
+        assert a["baseline_run_ids"] == ""
+        assert a["delta_sign_consistent"] is pd.NA
+        assert a["delta_exceeds_seed_delta_std"] is pd.NA
 
     def test_incomplete_baseline_is_flagged_on_compared_configs(self) -> None:
         rows = [_row("baseline", s, 30.0) for s in (0, 1)] + [_row("A", s, 31.0) for s in SEEDS]
@@ -230,6 +316,11 @@ class TestCompletenessAndDuplicates:
         assert bool(bic["is_complete"]) is False
         assert bic["incomplete_seeds"] == "0"
         assert bic["missing_seeds"] == ""
+        assert bic["n_seeds"] == 0
+        assert math.isnan(bic["mean"]) and math.isnan(bic["delta"])
+        assert bic["run_ids"] == ""
+        assert bic["incomplete_run_ids"] == "c0-bicubic-s0"
+        assert bic["baseline_run_ids"] == ""
 
     def test_empty_expected_seeds_is_rejected(self) -> None:
         with pytest.raises(ValueError, match="expected_seeds"):
@@ -281,11 +372,17 @@ class TestDirectFrameInput:
         with pytest.raises(ValueError, match="patch_pool_id"):
             compute_result_tables(_frame(rows), expected_seeds=SEEDS)
 
-    @pytest.mark.parametrize("value", [math.nan, math.inf])
-    def test_compute_rejects_non_finite_metric(self, value: float) -> None:
+    @pytest.mark.parametrize(("column", "value"), [("lpips", math.nan), ("lpips", math.inf), ("psnr_y", -math.inf)])
+    def test_compute_rejects_disallowed_non_finite_metric(self, column: str, value: float) -> None:
         frame = _fake_records()
-        frame.loc[0, "lpips"] = value
-        with pytest.raises(ValueError, match="lpips"):
+        frame.loc[0, column] = value
+        with pytest.raises(ValueError, match=column):
+            compute_result_tables(frame, expected_seeds=SEEDS)
+
+    def test_compute_rejects_unknown_status(self) -> None:
+        frame = _fake_records()
+        frame.loc[0, "status"] = "done"
+        with pytest.raises(ValueError, match="status"):
             compute_result_tables(frame, expected_seeds=SEEDS)
 
 
@@ -372,21 +469,76 @@ class TestLoadRunRecords:
 
     @pytest.mark.parametrize(
         ("column", "value"),
-        [("psnr_y", "NaN"), ("lpips", "nan"), ("ssim_y", "inf"), ("params", "abc"), ("psnr_y_pre_rgb", "inf")],
+        [("psnr_y", "NaN"), ("psnr_y", "-inf"), ("lpips", "nan"), ("ssim_y", "inf"), ("params", "abc"), ("psnr_y_pre_rgb", "-inf")],
     )
-    def test_rejects_non_finite_or_non_numeric_summary_value(self, tmp_path: Path, column: str, value: str) -> None:
+    def test_rejects_disallowed_non_finite_or_non_numeric_summary_value(self, tmp_path: Path, column: str, value: str) -> None:
         self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
         path = tmp_path / "c0-baseline-s0" / "summary.csv"
         pd.read_csv(path).assign(**{column: value}).to_csv(path, index=False)
         with pytest.raises(ValueError, match=column):
             load_run_records(tmp_path)
 
-    def test_rejects_non_finite_per_image_value(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(("column", "value"), [("ssim_y", "inf"), ("lpips", "inf"), ("edge_psnr", "-inf"), ("psnr_y", "NaN")])
+    def test_rejects_disallowed_non_finite_per_image_value(self, tmp_path: Path, column: str, value: str) -> None:
         self._write_run(tmp_path, _row("baseline", 0, 30.0), [("im1", 30.0)])
         path = tmp_path / "c0-baseline-s0" / "per_image.csv"
-        pd.read_csv(path).assign(edge_psnr="inf").to_csv(path, index=False)
-        with pytest.raises(ValueError, match="edge_psnr"):
+        pd.read_csv(path).assign(**{column: value}).to_csv(path, index=False)
+        with pytest.raises(ValueError, match=column):
             load_run_records(tmp_path)
+
+    def test_loads_and_aggregates_flat_synthetic_bicubic_csv_written_by_evaluator(self, tmp_path: Path) -> None:
+        """평가기가 평탄 합성 영상으로 쓴 Bicubic 하한 CSV(+inf PSNR)가 집계까지 정상 통과해야 한다."""
+        import numpy as np
+        import torch
+        import yaml
+        from PIL import Image
+
+        from sr_pipeline.data.prepare import prepare_testsets
+        from sr_pipeline.evaluation.evaluator import evaluate_model
+
+        class _StubLpips(torch.nn.Module):
+            def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                return (x - y).pow(2).mean().view(1, 1, 1, 1)
+
+        repo_root = Path(__file__).resolve().parents[1]
+        fair = yaml.safe_load((repo_root / "configs" / "fair_comparison.yaml").read_text(encoding="utf-8"))
+        fair["fixed_rules"]["datasets"] = ["Set5"]
+        fair["pilot_determined"]["edge_top_q"] = 10
+        fair["pilot_determined"]["representative_images"] = {"Set5": {"median": None, "worst": None}}
+        fair["infer_benchmark"].update(lr_height=12, lr_width=16, sr_height=48, sr_width=64, warmup_runs=1, repeat_runs=1)
+
+        hr_root = tmp_path / "hr_src"
+        (hr_root / "Set5").mkdir(parents=True)
+        flat = np.full((28, 28, 3), 128, dtype=np.uint8)
+        Image.fromarray(flat).save(hr_root / "Set5" / "flat0.png")
+        data_dir = tmp_path / "data"
+        prepare_testsets(hr_root, data_dir, 4, ["Set5"], "bicubic", "matlab_imresize_antialias")
+
+        runs_dir = tmp_path / "runs"
+        run_meta = {
+            "run_id": "c0-bicubic-s0",
+            "commit": "c0",
+            "config_id": "bicubic",
+            "seed": 0,
+            "patch_pool_id": POOL,
+            "switches": {"A": False, "B": False, "C": False, "Bp": False},
+            "params": 0,
+            "train_minutes": 0.0,
+            "status": "complete",
+        }
+        evaluate_model(None, run_meta, data_dir, runs_dir / "c0-bicubic-s0", fair_comparison=fair, lpips_model=_StubLpips())
+
+        summary, per_image = load_run_records(runs_dir)
+        assert math.isinf(summary["psnr_y"].iloc[0]) and summary["psnr_y"].iloc[0] > 0
+        assert math.isinf(per_image["edge_psnr"].iloc[0]) and per_image["edge_psnr"].iloc[0] > 0
+
+        tables = compute_result_tables(summary, expected_seeds=SEEDS)
+        bic = _result(tables, "bicubic", metric="psnr_y", dataset="Set5")
+        assert bool(bic["is_complete"]) is True
+        assert math.isinf(bic["mean"]) and bic["mean"] > 0
+        assert math.isnan(bic["std"]) and math.isnan(bic["delta"])
+        assert bic["delta_sign_consistent"] is pd.NA
+        assert bic["delta_exceeds_seed_delta_std"] is pd.NA
 
     def test_reads_records_written_with_evaluator_record_fields(self, tmp_path: Path) -> None:
         """evaluator가 쓰는 필드(SummaryRecord·PerImageRecord)와 집계가 읽는 필드가 어긋나지 않아야 한다."""
