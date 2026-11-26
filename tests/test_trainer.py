@@ -488,15 +488,24 @@ def test_pool_whose_scale_differs_from_the_model_is_rejected(tmp_path: Path) -> 
 
 
 # ---- 학습부터 평가까지 한 번에 (US31, 34-36) ----
-# 실제 평가(`evaluate_model`)는 T3.6 몫이라 호출 경계만 확인한다.
+# 실제 평가(`evaluate_model`)는 tests/test_evaluator.py가 검증하므로 여기서는 호출 경계만 확인한다.
 
 
 class FakeEvaluator:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    def __call__(self, model, run_meta, data_dir, output_dir):
-        self.calls.append({"model": model, "run_meta": run_meta, "data_dir": data_dir, "output_dir": output_dir})
+    def __call__(self, model, run_meta, data_dir, output_dir, *, fair_comparison, device):
+        self.calls.append(
+            {
+                "model": model,
+                "run_meta": run_meta,
+                "data_dir": data_dir,
+                "output_dir": output_dir,
+                "fair_comparison": fair_comparison,
+                "device": device,
+            }
+        )
         return [], []
 
 
@@ -524,6 +533,7 @@ def test_train_and_evaluate_trains_then_hands_the_model_and_run_meta_to_the_eval
     assert run_dir == tmp_path / "records" / run_id
     (call,) = evaluator.calls
     assert call["output_dir"] == run_dir and call["data_dir"] == data_dir
+    assert call["fair_comparison"]["fixed_rules"]["shave_border"] == 4 and call["device"] == "cpu"
     assert call["model"].use_y_channel and not call["model"].training
     run_meta = dict(call["run_meta"])
     train_minutes = run_meta.pop("train_minutes")

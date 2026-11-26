@@ -1,4 +1,4 @@
-"""패치 풀 데이터셋 로더. `TestsetDataset`은 T3.6(평가)에서 구현할 스켈레톤이다."""
+"""패치 풀 데이터셋(학습)과 테스트셋 데이터셋(평가) 로더."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
+from PIL import Image
 
-from sr_pipeline.data.prepare import METADATA_FILENAME, POOL_DIRNAME
+from sr_pipeline.data.prepare import METADATA_FILENAME, POOL_DIRNAME, TESTSETS_DIRNAME, _list_images
 from sr_pipeline.data.sampler import SeededEpochPatchSampler, augment_patch
 
 
@@ -87,15 +89,80 @@ class PatchPoolDataset:
 
 
 class TestsetDataset:
-    """Set5, Set14, BSD100, Urban100 평가용 (LR, HR, image_id) 데이터셋."""
+    """Set5, Set14, BSD100, Urban100 평가용 (LR, HR, image_id) 데이터셋.
+
+    `data.prepare.prepare_testsets`의 산출물 `<data_dir>/testsets/<데이터셋>/{LR,HR}/<image_id>.png`를 읽는다.
+    평가는 modcrop을 거쳐 저장된 HR만 쓴다. 영상은 image_id(파일명) 순이며, 각 항목은
+    `{"image_id": str, "lr": (1, 3, h, w), "hr": (1, 3, h·배율, w·배율)}`(float32, [0, 1])다.
+    """
+
+    __test__ = False  # 이름이 Test로 시작해도 pytest 수집 대상이 아니다.
 
     def __init__(self, data_dir: Path, dataset_name: str) -> None:
         self.data_dir = data_dir
         self.dataset_name = dataset_name
-        raise NotImplementedError("TODO: Load paired LR/HR test images for evaluation.")
+        testsets_dir = Path(data_dir) / TESTSETS_DIRNAME
+        scale = _read_testset_scale(testsets_dir)
+        self.scale = scale
+        lr_dir = testsets_dir / dataset_name / "LR"
+        hr_dir = testsets_dir / dataset_name / "HR"
+        for directory in (lr_dir, hr_dir):
+            if not directory.is_dir():
+                raise ValueError(f"테스트셋 {dataset_name}의 폴더가 없습니다: {directory}")
+        lr_paths = {p.stem: p for p in _list_images(lr_dir)}
+        hr_paths = {p.stem: p for p in _list_images(hr_dir)}
+        if not hr_paths:
+            raise ValueError(f"테스트셋 {dataset_name}에 영상이 없습니다: {hr_dir}")
+        if lr_paths.keys() != hr_paths.keys():
+            only_lr = sorted(lr_paths.keys() - hr_paths.keys())
+            only_hr = sorted(hr_paths.keys() - lr_paths.keys())
+            raise ValueError(f"테스트셋 {dataset_name}의 LR·HR 영상 목록이 다릅니다: LR만 {only_lr}, HR만 {only_hr}")
+        self._image_ids = sorted(hr_paths)
+        self._lr_paths = lr_paths
+        self._hr_paths = hr_paths
+        for image_id in self._image_ids:  # 크기 대응은 처음에 모두 확인해 평가 도중 실패하지 않게 한다.
+            lr_size, hr_size = _image_size(lr_paths[image_id]), _image_size(hr_paths[image_id])
+            if hr_size != (lr_size[0] * scale, lr_size[1] * scale):
+                raise ValueError(
+                    f"{dataset_name}/{image_id}의 HR 크기 {hr_size}가 LR {lr_size}의 x{scale}가 아닙니다."
+                )
+
+    @property
+    def image_ids(self) -> list[str]:
+        """image_id 목록(`__getitem__` 순서). 영상을 읽지 않고 id만 확인할 때 쓴다."""
+        return list(self._image_ids)
 
     def __len__(self) -> int:
-        raise NotImplementedError
+        return len(self._image_ids)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        raise NotImplementedError
+        if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < len(self):
+            raise IndexError(f"영상 번호 {idx!r}가 범위 [0, {len(self)})를 벗어났습니다.")
+        image_id = self._image_ids[idx]
+        return {
+            "image_id": image_id,
+            "lr": _load_unit_tensor(self._lr_paths[image_id]),
+            "hr": _load_unit_tensor(self._hr_paths[image_id]),
+        }
+
+
+def _read_testset_scale(testsets_dir: Path) -> int:
+    path = testsets_dir / METADATA_FILENAME
+    if not path.is_file():
+        raise ValueError(f"테스트셋 metadata.json이 없습니다: {path}")
+    scale = json.loads(path.read_text(encoding="utf-8")).get("scale")
+    if isinstance(scale, bool) or not isinstance(scale, int) or scale < 1:
+        raise ValueError(f"테스트셋 metadata.json의 scale은 1 이상의 정수여야 합니다: {scale!r} ({path})")
+    return scale
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return image.height, image.width
+
+
+def _load_unit_tensor(path: Path) -> torch.Tensor:
+    """PNG를 (1, 3, H, W) float32 [0, 1] 텐서로 읽는다(uint8 / 255)."""
+    with Image.open(path) as image:
+        array = np.array(image.convert("RGB"), dtype=np.uint8)
+    return torch.from_numpy(array).permute(2, 0, 1).float().div(255.0).unsqueeze(0)

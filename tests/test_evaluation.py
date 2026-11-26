@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 import torch
 
-from sr_pipeline.evaluation.metrics import compute_psnr, compute_ssim_y
+from sr_pipeline.diagnosis.diagnostics import compute_edge_flat_psnr
+from sr_pipeline.evaluation.metrics import compute_edge_psnr, compute_lpips, compute_psnr, compute_ssim_y
 from sr_pipeline.evaluation.postprocess import postprocess_to_y, quantize_and_shave
 
 
@@ -84,9 +85,48 @@ def test_border_4px_difference_does_not_affect_metrics() -> None:
     assert compute_ssim_y(y_border_only, y_hr) == 1.0
 
 
-@pytest.mark.skip(reason="Skeleton test: implement alongside evaluation.metrics (T3.6)")
 def test_edge_psnr_defined_on_completely_flat_image() -> None:
     """완전히 평탄한 영상에서도 에지 PSNR이 정의되어야 합니다."""
+    hr_y = torch.full((1, 1, 16, 20), 100.0)
+    assert compute_edge_psnr(hr_y.clone(), hr_y, top_q_percent=10.0) == math.inf
+    # 평탄 HR에 전 화소 오차 1.0이면 에지 영역 선택과 무관하게 MSE = 1.
+    assert compute_edge_psnr(hr_y + 1.0, hr_y, top_q_percent=10.0) == pytest.approx(
+        20.0 * math.log10(255.0), abs=1e-12
+    )
+
+
+def test_edge_psnr_uses_only_top_q_percent_sobel_pixels_of_hr() -> None:
+    """에지 PSNR은 HR Y Sobel 크기 상위 q% 화소의 오차만 반영합니다."""
+    # 왼쪽 절반 0, 오른쪽 절반 100인 수직 경계 HR: Sobel 응답은 경계 두 열에만 있다.
+    hr_y = torch.zeros(1, 1, 10, 10)
+    hr_y[..., 5:] = 100.0
+    edge_cols = [4, 5]
+    sr_y = hr_y.clone()
+    sr_y[..., edge_cols] += 3.0  # 에지 화소에만 오차 3.0
+    # 상위 20% = 200 / 10행 x 2열 = 20화소 -> 정확히 경계 두 열 -> MSE 9
+    assert compute_edge_psnr(sr_y, hr_y, top_q_percent=20.0) == pytest.approx(
+        10.0 * math.log10(255.0**2 / 9.0), abs=1e-9
+    )
+    # 에지가 아닌 곳의 큰 오차는 영향이 없다.
+    sr_far = hr_y.clone()
+    sr_far[..., :2] += 50.0
+    assert compute_edge_psnr(sr_far, hr_y, top_q_percent=20.0) == math.inf
+
+
+def test_edge_psnr_matches_diagnosis_edge_region() -> None:
+    """평가의 에지 영역 정의가 진단 모듈과 갈라지지 않아야 합니다."""
+    generator = torch.Generator().manual_seed(3)
+    hr_y = torch.rand(1, 1, 24, 30, generator=generator) * 219.0 + 16.0
+    sr_y = hr_y + 5.0 * torch.randn(1, 1, 24, 30, generator=generator)
+    expected = compute_edge_flat_psnr(sr_y, hr_y, 15.0)["edge_psnr_y"]
+    assert compute_edge_psnr(sr_y, hr_y, top_q_percent=15.0) == pytest.approx(expected, abs=1e-9)
+
+
+@pytest.mark.parametrize("q", [0.0, 100.0, -5.0, 150.0, float("nan")])
+def test_edge_psnr_rejects_invalid_q(q: float) -> None:
+    y = torch.rand(1, 1, 16, 16)
+    with pytest.raises(ValueError):
+        compute_edge_psnr(y, y, top_q_percent=q)
 
 
 def test_clamp_and_quantize_order_consistent_across_configs() -> None:
@@ -218,3 +258,56 @@ def test_compute_ssim_y_matches_matlab_basicsr_reference() -> None:
 def test_compute_ssim_y_rejects_invalid_inputs(sr_y: torch.Tensor, hr_y: torch.Tensor) -> None:
     with pytest.raises(ValueError):
         compute_ssim_y(sr_y, hr_y)
+
+
+class _RecordingLpips(torch.nn.Module):
+    """입력을 기록하고 입력 차이의 평균 제곱을 돌려주는 LPIPS 대역(실제 AlexNet 가중치 불필요)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        self.inputs.append((x.clone(), y.clone()))
+        return (x - y).pow(2).mean().view(1, 1, 1, 1)
+
+
+def test_compute_lpips_feeds_minus_one_to_one_rgb_and_returns_float() -> None:
+    """[0, 1] RGB가 [-1, 1]로 바뀌어 LPIPS 모델에 들어가고, 결과는 파이썬 float여야 합니다."""
+    sr = torch.zeros(1, 3, 12, 12)
+    hr = torch.ones(1, 3, 12, 12)
+    stub = _RecordingLpips()
+
+    value = compute_lpips(sr, hr, lpips_model=stub)
+
+    (fed_sr, fed_hr), = stub.inputs
+    assert fed_sr.min().item() == -1.0 and fed_sr.max().item() == -1.0
+    assert fed_hr.min().item() == 1.0 and fed_hr.max().item() == 1.0
+    assert isinstance(value, float)
+    assert value == pytest.approx(4.0)  # (-1 - 1)^2
+
+
+@pytest.mark.parametrize(
+    ("sr", "hr"),
+    [
+        (torch.rand(1, 1, 12, 12), torch.rand(1, 1, 12, 12)),  # RGB 아님
+        (torch.rand(2, 3, 12, 12), torch.rand(2, 3, 12, 12)),  # batch != 1
+        (torch.rand(1, 3, 12, 12), torch.rand(1, 3, 12, 13)),  # shape 불일치
+    ],
+)
+def test_compute_lpips_rejects_invalid_inputs(sr: torch.Tensor, hr: torch.Tensor) -> None:
+    with pytest.raises(ValueError):
+        compute_lpips(sr, hr, lpips_model=_RecordingLpips())
+
+
+def test_compute_lpips_real_alexnet_identical_zero_and_different_positive() -> None:
+    """실제 AlexNet LPIPS(가중치 다운로드 필요): 같은 영상은 0, 다른 영상은 양수. 가중치를 못 받으면 건너뜁니다."""
+    generator = torch.Generator().manual_seed(5)
+    a = torch.rand(1, 3, 64, 64, generator=generator)
+    b = torch.rand(1, 3, 64, 64, generator=generator)
+    try:
+        same = compute_lpips(a, a)
+    except Exception as error:  # 오프라인 등으로 백본 가중치를 못 받는 경우
+        pytest.skip(f"AlexNet LPIPS를 만들 수 없습니다: {error}")
+    assert same == pytest.approx(0.0, abs=1e-6)
+    assert compute_lpips(a, b) > 0.0
