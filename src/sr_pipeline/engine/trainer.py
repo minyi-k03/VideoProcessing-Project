@@ -355,5 +355,5 @@ def train_and_evaluate(
         run_meta.update(params=0, train_minutes=0.0, status=COMPLETE)
 
     run_dir = Path(output_dir) / run_id
-    evaluate_model(model, run_meta, data_dir, run_dir)
+    evaluate_model(model, run_meta, data_dir, run_dir, fair_comparison=run_config.fair_comparison, device=device)
     return run_dir
