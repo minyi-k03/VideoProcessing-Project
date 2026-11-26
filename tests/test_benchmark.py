@@ -10,7 +10,7 @@ import torch
 from sr_pipeline.evaluation.benchmark import measure_inference_time
 from sr_pipeline.models.espcn import ESPCN
 
-SMALL = {"lr_height": 12, "lr_width": 16, "warmup_runs": 1, "repeat_runs": 2}
+SMALL = {"scale": 4, "lr_height": 12, "lr_width": 16, "warmup_runs": 1, "repeat_runs": 2}
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"use_y_channel": True}, {"use_global_residual": True}])
@@ -37,11 +37,27 @@ def test_measure_inference_time_leaves_model_state_untouched() -> None:
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"lr_height": 0}, {"lr_width": -1}, {"warmup_runs": -1}, {"repeat_runs": 0}, {"repeat_runs": True}],
+    [
+        {"lr_height": 0},
+        {"lr_width": -1},
+        {"warmup_runs": -1},
+        {"repeat_runs": 0},
+        {"repeat_runs": True},
+        {"scale": 0},
+        {"scale": True},
+    ],
 )
-def test_measure_inference_time_rejects_invalid_settings(kwargs: dict) -> None:
+@pytest.mark.parametrize("model", [ESPCN().eval(), None])
+def test_measure_inference_time_rejects_invalid_settings(kwargs: dict, model) -> None:
     with pytest.raises(ValueError):
-        measure_inference_time(ESPCN().eval(), **{**SMALL, **kwargs})
+        measure_inference_time(model, **{**SMALL, **kwargs})
+
+
+@pytest.mark.parametrize("missing", sorted(SMALL))
+def test_fair_comparison_settings_have_no_defaults(missing: str) -> None:
+    """측정 조건은 `fair_comparison.yaml`의 `infer_benchmark`·배율에서만 온다(함수 기본값 없음)."""
+    with pytest.raises(TypeError):
+        measure_inference_time(None, **{k: v for k, v in SMALL.items() if k != missing})
 
 
 def test_measure_inference_time_rejects_model_without_network_stage() -> None:

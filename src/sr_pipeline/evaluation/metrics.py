@@ -111,6 +111,16 @@ def _sobel_magnitude(y: torch.Tensor) -> torch.Tensor:
     return grad.pow(2).sum(dim=1).sqrt()[0]
 
 
+def _check_top_q(top_q_percent: object, name: str = "top_q_percent") -> None:
+    """에지 영역 비율 q(%)가 0과 100 사이의 수인지 검증합니다(bool 제외)."""
+    if (
+        isinstance(top_q_percent, bool)
+        or not isinstance(top_q_percent, (int, float))
+        or not (0.0 < top_q_percent < 100.0)
+    ):
+        raise ValueError(f"{name}는 0과 100 사이의 수여야 합니다. 받은 값: {top_q_percent!r}")
+
+
 def compute_edge_psnr(
     sr_y: torch.Tensor,
     hr_y: torch.Tensor,
@@ -122,12 +132,7 @@ def compute_edge_psnr(
     영상에서도 정의되며, 동률은 안정 정렬(앞 화소 우선)로 장치와 무관하게 같은 화소가 뽑힌다.
     입력은 가장자리를 이미 잘라낸 (1, 1, H, W) Y(16~235 스케일)이며 오차가 0이면 inf다.
     """
-    if (
-        isinstance(top_q_percent, bool)
-        or not isinstance(top_q_percent, (int, float))
-        or not (0.0 < top_q_percent < 100.0)
-    ):
-        raise ValueError(f"top_q_percent는 0과 100 사이의 수여야 합니다. 받은 값: {top_q_percent!r}")
+    _check_top_q(top_q_percent)
     _check_image_pair(sr_y, hr_y, labels=("sr_y", "hr_y"), channels=1)
     magnitude = _sobel_magnitude(hr_y.double()).flatten()
     count = math.ceil(magnitude.numel() * top_q_percent / 100.0)
@@ -141,10 +146,15 @@ def compute_edge_psnr(
 
 @lru_cache(maxsize=None)
 def _alex_lpips(device: torch.device) -> torch.nn.Module:
-    """AlexNet 백본 LPIPS(v0.1)를 장치별로 한 번만 만듭니다. 처음 만들 때 백본 가중치를 내려받습니다."""
+    """AlexNet 백본 LPIPS(v0.1)를 장치별로 한 번만 만듭니다. 처음 만들 때 백본 가중치를 내려받습니다.
+
+    `_ssim_window`·`common.color._constants`와 같은 이유로, 평가의 `torch.inference_mode()` 안에서
+    처음 불려도 캐시에 inference 텐서가 남지 않게 inference_mode를 끄고 만든다.
+    """
     import lpips
 
-    return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    with torch.inference_mode(False):
+        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
 
 
 def compute_lpips(

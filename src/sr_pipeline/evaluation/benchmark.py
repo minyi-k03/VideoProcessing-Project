@@ -1,6 +1,7 @@
 """파라미터 수 및 고정 입력 크기 추론 시간 측정 모듈 (SPEC.md / ADR-0003).
 
-측정 조건: LR 320x180 -> SR 1280x720, T4 GPU, 배치 1, FP32, 워밍업 10회 후 100회 평균,
+측정 조건(입력 크기, 워밍업·반복 횟수, 배율)은 `configs/fair_comparison.yaml`의 `infer_benchmark`·
+`fixed_rules.scale`에서만 받고 이 모듈에는 기본값을 두지 않습니다. 배치 1, FP32, 워밍업 후 반복 평균,
 GPU 동기화 포함. "네트워크만(infer_ms_net)"과 "색 변환·bicubic 포함 전체(infer_ms_total)"를 분리 기록합니다.
 """
 
@@ -13,8 +14,6 @@ import torch
 import torch.nn as nn
 
 from sr_pipeline.common.bicubic import bicubic_resize
-
-SCALE = 4.0
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -46,21 +45,25 @@ def _synchronize(device: torch.device) -> None:
 
 def measure_inference_time(
     model: nn.Module | None,
-    lr_height: int = 180,
-    lr_width: int = 320,
-    warmup_runs: int = 10,
-    repeat_runs: int = 100,
+    *,
+    scale: int,
+    lr_height: int,
+    lr_width: int,
+    warmup_runs: int,
+    repeat_runs: int,
     device: str | torch.device = "cpu",
 ) -> tuple[float, float]:
     """`(infer_ms_net, infer_ms_total)`을 밀리초 단위로 측정합니다.
 
+    `scale`은 `fixed_rules.scale`, 나머지 측정 조건은 `infer_benchmark` 값을 호출자가 그대로 넘긴다.
     입력은 배치 1·FP32의 `(1, 3, lr_height, lr_width)` 난수 RGB다(값은 시간에 영향이 없다).
     - `infer_ms_total`: 색 변환·bicubic 경로를 포함한 `model(lr)` 전체. `model`이 `None`(Bicubic 하한)이면
-      bicubic 확대(`common.bicubic.bicubic_resize`)만 잰다.
+      `scale`배 bicubic 확대(`common.bicubic.bicubic_resize`)만 잰다.
     - `infer_ms_net`: 신경망(`model._network`)만. 입력 채널은 구성에 맞춘다(RGB 3, Y 1). 신경망이 없는
       Bicubic 하한은 0.0이다.
     모델은 평가 모드로 두고 `torch.inference_mode()` 안에서 잰다. CPU 값은 T4 기준 값과 비교할 수 없다.
     """
+    _check_count("scale", scale, 1)
     _check_count("lr_height", lr_height, 1)
     _check_count("lr_width", lr_width, 1)
     _check_count("warmup_runs", warmup_runs, 0)
@@ -70,7 +73,7 @@ def measure_inference_time(
 
     if model is None:
         with torch.inference_mode():
-            total_ms = _time_ms(lambda: bicubic_resize(lr, SCALE), target, warmup_runs, repeat_runs)
+            total_ms = _time_ms(lambda: bicubic_resize(lr, float(scale)), target, warmup_runs, repeat_runs)
         return 0.0, total_ms
 
     if not callable(getattr(model, "_network", None)):

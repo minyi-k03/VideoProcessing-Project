@@ -15,7 +15,10 @@ import yaml
 from PIL import Image
 
 from sr_pipeline.common.bicubic import bicubic_resize
+from sr_pipeline.common.color import normalize_y, rgb_to_y
+from sr_pipeline.data.dataset import TestsetDataset
 from sr_pipeline.data.prepare import prepare_testsets
+from sr_pipeline.evaluation import evaluator as evaluator_module
 from sr_pipeline.evaluation.evaluator import PerImageRecord, SummaryRecord, evaluate_model
 from sr_pipeline.models.espcn import ESPCN
 
@@ -40,6 +43,23 @@ class BicubicAsModel(torch.nn.Module):
 
     def forward(self, lr_rgb: torch.Tensor) -> torch.Tensor:
         return bicubic_resize(lr_rgb, 4.0)
+
+
+class ExactYModel(BicubicAsModel):
+    """B 계열 대역: RGB는 bicubic 확대, RGB로 되돌리기 전 Y(`sr_y_norm`)는 HR 영상의 Y 그대로."""
+
+    def __init__(self, data_dir: Path) -> None:
+        super().__init__()
+        self._hr_by_lr: dict[bytes, torch.Tensor] = {}
+        for name in DATASETS:
+            dataset = TestsetDataset(data_dir, name)
+            for index in range(len(dataset)):
+                sample = dataset[index]
+                self._hr_by_lr[sample["lr"].numpy().tobytes()] = sample["hr"]
+
+    def forward_raw(self, lr_rgb: torch.Tensor) -> dict[str, torch.Tensor]:
+        hr = self._hr_by_lr[lr_rgb.cpu().numpy().tobytes()]
+        return {"sr_rgb": bicubic_resize(lr_rgb, 4.0), "sr_y_norm": normalize_y(rgb_to_y(hr))}
 
 
 @pytest.fixture(scope="module")
@@ -166,6 +186,59 @@ def test_psnr_y_pre_rgb_is_close_to_psnr_y(tmp_path: Path, data_dir: Path) -> No
     rows, _ = evaluate(ESPCN(use_y_channel=True).eval(), tmp_path, data_dir, meta=run_meta("B", {"B": True}))
     for s in rows:
         assert s.psnr_y_pre_rgb == pytest.approx(s.psnr_y, abs=1.0)
+
+
+def test_psnr_y_pre_rgb_is_unbounded_when_y_before_rgb_is_exact(tmp_path: Path, data_dir: Path) -> None:
+    """RGB로 되돌리기 전 Y가 HR Y와 같으면 진단값은 오차 0이다. Y를 정수로 반올림하면 약 59 dB에서 막힌다."""
+    rows, _ = evaluate(ExactYModel(data_dir).eval(), tmp_path, data_dir, meta=run_meta("B", {"B": True}))
+    assert all(s.psnr_y_pre_rgb is not None and s.psnr_y_pre_rgb > 100.0 for s in rows)
+
+
+@pytest.mark.parametrize(
+    ("model_factory", "switches"),
+    [
+        (lambda: ESPCN().eval(), {"B": True}),  # B인데 RGB로 되돌리기 전 Y가 없다
+        (lambda: ESPCN(use_y_channel=True).eval(), {}),  # B가 아닌데 Y를 낸다
+    ],
+)
+def test_b_switch_must_match_model_y_output(tmp_path: Path, data_dir: Path, model_factory, switches: dict) -> None:
+    with pytest.raises(ValueError, match="B"):
+        evaluate(model_factory(), tmp_path, data_dir, meta=run_meta("x", switches))
+    assert not (tmp_path / "run" / "summary.csv").exists()
+
+
+def test_caller_training_mode_is_restored(tmp_path: Path, data_dir: Path) -> None:
+    model = ESPCN().train()
+    evaluate(model, tmp_path, data_dir)
+    assert model.training
+
+
+@pytest.mark.parametrize("edge_q", [150, 0, True])
+def test_out_of_range_edge_top_q_is_rejected_before_creating_output(tmp_path: Path, data_dir: Path, edge_q) -> None:
+    with pytest.raises(ValueError, match="edge_top_q"):
+        evaluate(ESPCN().eval(), tmp_path, data_dir, config=fair(edge_top_q=edge_q))
+    assert not (tmp_path / "run").exists()
+
+
+def test_failed_move_from_staging_leaves_no_partial_records(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_replace = evaluator_module.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("디스크 오류 흉내")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(evaluator_module.os, "replace", flaky_replace)
+    rep = {name: {"median": "img0", "worst": None} for name in DATASETS}
+    with pytest.raises(OSError):
+        evaluate(ESPCN().eval(), tmp_path, data_dir, config=fair(representative=rep))
+    monkeypatch.undo()
+    run = tmp_path / "run"
+    assert not any((run / name).exists() for name in ("summary.csv", "per_image.csv", "images", ".evaluation_tmp"))
 
 
 def test_switches_are_written_as_plus_joined_enabled_names(tmp_path: Path, data_dir: Path) -> None:

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,7 @@ from sr_pipeline.common.color import denormalize_y, rgb_to_y
 from sr_pipeline.data.dataset import TestsetDataset
 from sr_pipeline.evaluation.benchmark import measure_inference_time
 from sr_pipeline.evaluation.metrics import (
+    _check_top_q,
     _sobel_magnitude,
     compute_edge_psnr,
     compute_lpips,
@@ -113,6 +116,7 @@ def _check_inputs(run_meta: dict[str, Any], fair_comparison: dict[str, Any]) -> 
     edge_q = fair_comparison["pilot_determined"]["edge_top_q"]
     if edge_q is None:
         raise ValueError("pilot_determined.edge_top_q가 null입니다. T4.2에서 고정하기 전에는 평가할 수 없습니다.")
+    _check_top_q(edge_q, "pilot_determined.edge_top_q")
     bench = fair_comparison["infer_benchmark"]
     if bench["precision"] != "fp32" or bench["batch_size"] != 1:
         raise ValueError(
@@ -145,8 +149,12 @@ def _shave(y: torch.Tensor, border: int) -> torch.Tensor:
 
 
 def _pre_rgb_psnr(sr_y_norm: torch.Tensor, hr_y: torch.Tensor, border: int) -> float:
-    """RGB로 되돌리기 전 Y의 PSNR(Y): [0, 1] 자르기 → Y 스케일 복원 → 8비트 Y 수준 반올림 → 가장자리 자르기."""
-    y = denormalize_y(sr_y_norm.clamp(0.0, 1.0)).round()
+    """RGB로 되돌리기 전 Y의 PSNR(Y): 정규화 Y를 [0, 1]로 자르고 Y 스케일(16~235)로 복원 → 가장자리 자르기.
+
+    `hr_y`(`common.color.rgb_to_y`)도 반올림하지 않은 Y이므로 여기서도 정수로 반올림하지 않는다.
+    반올림하면 Y가 정확해도 약 59 dB에서 막혀, RGB 왕복의 자르기·양자화 영향(ADR-0003)을 잴 수 없다.
+    """
+    y = denormalize_y(sr_y_norm.clamp(0.0, 1.0))
     return compute_psnr(_shave(y, border), hr_y)
 
 
@@ -157,11 +165,17 @@ def _evaluate_image(
     scale: int,
     border: int,
     edge_q: float,
+    switch_b: bool,
     lpips_model: torch.nn.Module | None,
     device: torch.device,
 ) -> tuple[dict[str, float | None], torch.Tensor]:
     lr, hr = sample["lr"].to(device), sample["hr"].to(device)
     sr, sr_y_norm = _super_resolve(model, lr, scale)
+    if model is not None and switch_b != (sr_y_norm is not None):
+        raise ValueError(
+            f"스위치 B={switch_b}인데 모델이 RGB로 되돌리기 전 Y(sr_y_norm)를 "
+            f"{'내지 않습니다' if switch_b else '냅니다'}. run_meta['switches']와 모델 구성이 다릅니다."
+        )
     if sr.shape != hr.shape:
         raise ValueError(f"{sample['image_id']}: SR 결과 {tuple(sr.shape)}가 HR {tuple(hr.shape)}와 다릅니다.")
     sr_q, hr_q = quantize_and_shave(sr, border=border), quantize_and_shave(hr, border=border)
@@ -227,10 +241,12 @@ def evaluate_model(
 
     산출물(`output_dir`): `summary.csv`, `per_image.csv`, 대표 영상이 지정돼 있으면
     `images/<데이터셋>/<image_id>_{median,worst}{,_roi}.png`. 대표 영상 id가 `null`이면 이미지만 건너뛴다.
-    이미 같은 이름의 기록이 있으면 `FileExistsError`로 거부하고, 임시 폴더에 다 쓴 뒤 옮긴다.
+    이미 같은 이름의 기록이 있으면 `FileExistsError`로 거부하고, 임시 폴더에 다 쓴 뒤 옮긴다(옮기다 실패하면
+    옮긴 것을 지운다). 모델은 평가 동안만 평가 모드로 두고 끝나면 호출자의 학습/평가 모드로 되돌린다.
 
     Raises:
-        ValueError: `run_meta`·공정 비교 조건·대표 영상 id가 잘못됐을 때(아무것도 쓰기 전에).
+        ValueError: `run_meta`·공정 비교 조건·대표 영상 id가 잘못됐을 때(아무것도 쓰기 전에), 또는
+            `run_meta['switches']`의 B와 모델의 `sr_y_norm` 출력 여부가 다를 때(기록을 남기지 않음).
         FileExistsError: 같은 이름의 기록이 이미 있을 때.
     """
     border, scale, datasets, edge_q, bench = _check_inputs(run_meta, fair_comparison)
@@ -251,10 +267,77 @@ def evaluate_model(
             if image_id is not None and image_id not in known:
                 raise ValueError(f"대표 영상 {name}.{kind}={image_id!r}이(가) 테스트셋에 없습니다.")
 
-    if model is not None:
-        model = model.to(target).eval()
+    with _evaluation_mode(model, target):
+        return _evaluate_and_write(
+            model,
+            run_meta,
+            loaded,
+            output_dir,
+            switches=switches,
+            scale=scale,
+            border=border,
+            edge_q=edge_q,
+            bench=bench,
+            representative=representative,
+            lpips_model=lpips_model,
+            target=target,
+        )
+
+
+@contextmanager
+def _evaluation_mode(model: nn.Module | None, device: torch.device) -> Iterator[None]:
+    """평가 동안만 모델을 `device`·평가 모드로 두고, 끝나면(예외가 나도) 호출자의 학습/평가 모드를 되돌린다."""
+    if model is None:
+        yield
+        return
+    was_training = model.training
+    model.to(device).eval()
+    try:
+        yield
+    finally:
+        model.train(was_training)
+
+
+def _move_from_staging(staging: Path, output_dir: Path) -> None:
+    """임시 폴더의 산출물을 `output_dir`로 옮긴다. 도중에 실패하면 이미 옮긴 것을 지워 반쪽 기록을 남기지 않는다.
+
+    옮길 이름들은 호출 전에 `output_dir`에 없음을 확인했으므로, 지워도 이전 기록을 잃지 않는다.
+    """
+    moved: list[Path] = []
+    try:
+        for entry in sorted(staging.iterdir()):
+            destination = output_dir / entry.name
+            os.replace(entry, destination)
+            moved.append(destination)
+    except BaseException:
+        for destination in moved:
+            if destination.is_dir():
+                shutil.rmtree(destination, ignore_errors=True)
+            else:
+                destination.unlink(missing_ok=True)
+        raise
+
+
+def _evaluate_and_write(
+    model: nn.Module | None,
+    run_meta: dict[str, Any],
+    loaded: dict[str, TestsetDataset],
+    output_dir: Path,
+    *,
+    switches: str,
+    scale: int,
+    border: int,
+    edge_q: float,
+    bench: dict[str, Any],
+    representative: dict[str, dict[str, str | None]],
+    lpips_model: torch.nn.Module | None,
+    target: torch.device,
+) -> tuple[list[SummaryRecord], list[PerImageRecord]]:
+    """추론 시간을 재고, 테스트셋마다 영상별 지표를 계산해 임시 폴더에 쓴 뒤 `output_dir`로 옮긴다."""
+    switch_b = bool(run_meta["switches"].get("B", False))
     infer_ms_net, infer_ms_total = measure_inference_time(
         model,
+        scale=scale,
         lr_height=bench["lr_height"],
         lr_width=bench["lr_width"],
         warmup_runs=bench["warmup_runs"],
@@ -275,7 +358,14 @@ def evaluate_model(
             for index in range(len(dataset)):
                 sample = dataset[index]
                 metrics, sr = _evaluate_image(
-                    model, sample, scale=scale, border=border, edge_q=edge_q, lpips_model=lpips_model, device=target
+                    model,
+                    sample,
+                    scale=scale,
+                    border=border,
+                    edge_q=edge_q,
+                    switch_b=switch_b,
+                    lpips_model=lpips_model,
+                    device=target,
                 )
                 rows.append(metrics)
                 per_images.append(
@@ -314,8 +404,7 @@ def evaluate_model(
             )
         pd.DataFrame([asdict(r) for r in per_images]).to_csv(staging / PER_IMAGE_FILENAME, index=False)
         pd.DataFrame([asdict(r) for r in summaries]).to_csv(staging / SUMMARY_FILENAME, index=False)
-        for entry in sorted(staging.iterdir()):
-            os.replace(entry, output_dir / entry.name)
+        _move_from_staging(staging, output_dir)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return summaries, per_images
