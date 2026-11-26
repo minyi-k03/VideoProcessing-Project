@@ -252,12 +252,43 @@ def test_wrong_archive_sha256_is_rejected_before_unpacking(
     assert only_run_dir(tmp_path / "records")
 
 
-def test_resume_run_id_of_another_run_is_rejected(
-    cli: ModuleType, tmp_path: Path, fair_path: Path, archive: Path
+@pytest.mark.parametrize(
+    ("config", "resume_run_id", "message"),
+    [("baseline", "other-baseline-s0", "resume_run_id"), ("bicubic", "other-bicubic-s0", "학습하지 않는 구성")],
+)
+def test_invalid_resume_request_is_rejected_before_unpacking(
+    cli: ModuleType, tmp_path: Path, fair_path: Path, archive: Path, config: str, resume_run_id: str, message: str
 ) -> None:
-    with pytest.raises(ValueError, match="resume_run_id"):
-        cli.main(args_for(tmp_path, fair_path, archive=archive) + ["--resume-run-id", "other-baseline-s0"])
-    assert not (tmp_path / "records").exists()
+    with pytest.raises(ValueError, match=message):
+        cli.main(args_for(tmp_path, fair_path, config=config, archive=archive) + ["--resume-run-id", resume_run_id])
+    assert not (tmp_path / "local_data").exists() and not (tmp_path / "records").exists()
+
+
+def test_dirty_run_cannot_be_resumed_and_is_rejected_before_unpacking(
+    cli: ModuleType, tmp_path: Path, fair_path: Path, archive: Path, code_repo: Path
+) -> None:
+    (code_repo / "src" / "module.py").write_text("x = 2\n", encoding="utf-8")
+    dirty_run_id = f"{git(code_repo, 'rev-parse', 'HEAD')}-dirty-baseline-s0"
+
+    with pytest.warns(UserWarning), pytest.raises(ValueError, match="재개할 수 없습니다"):
+        cli.main(args_for(tmp_path, fair_path, archive=archive) + ["--allow-dirty", "--resume-run-id", dirty_run_id])
+    assert not (tmp_path / "local_data").exists()
+
+
+def test_default_config_paths_do_not_depend_on_the_working_directory(
+    cli: ModuleType, tmp_path: Path, fair_path: Path, archive: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--experiments-config`를 주지 않고 저장소 밖에서 실행해도 저장소의 `configs/experiments.yaml`을 쓴다."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    cli.main(args_for(tmp_path, fair_path, archive=archive))
+
+    assert only_run_dir(tmp_path / "records")
+    defaults = cli.parse_args(["--config", "baseline", "--seed", "0", "--data-dir", "d", "--checkpoint-dir", "c"])
+    assert defaults.output_dir == REPO_ROOT / "results" / "runs"
+    assert defaults.fair_config == REPO_ROOT / "configs" / "fair_comparison.yaml"
 
 
 def test_help_lists_the_path_arguments(cli: ModuleType, capsys: pytest.CaptureFixture[str]) -> None:

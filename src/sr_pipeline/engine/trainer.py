@@ -304,6 +304,26 @@ def train_run(
     )
 
 
+def check_resume_request(run_config: ResolvedRunConfig, commit: str, resume_run_id: str | None) -> str:
+    """이번 실행의 run_id를 돌려주고, 재개 요청이 이어 갈 수 없는 것이면 `ValueError`로 거부합니다.
+
+    학습 없는 구성, 이번 실행과 다른 run_id, `-dirty` 실행은 재개할 수 없다. 실행 CLI가 큰 압축 파일을 풀기 전에도 부른다.
+    """
+    run_id = build_run_id(commit, run_config.config_id, run_config.seed)
+    if resume_run_id is None:
+        return run_id
+    if not run_config.trainable:
+        raise ValueError(f"구성 {run_config.config_id}는 학습하지 않는 구성이라 재개할 학습이 없습니다: {resume_run_id}")
+    if resume_run_id != run_id:
+        raise ValueError(f"resume_run_id({resume_run_id})가 이번 실행의 run_id({run_id})와 다릅니다.")
+    if commit.endswith(DIRTY_SUFFIX):
+        raise ValueError(
+            f"커밋되지 않은 변경이 있는 채로 시작한 실행({run_id})은 재개할 수 없습니다: 끊긴 사이 코드가 또 바뀌었는지 "
+            "run_id로 확인할 수 없습니다. 처음부터 다시 실행하세요."
+        )
+    return run_id
+
+
 def train_and_evaluate(
     run_config: ResolvedRunConfig,
     data_dir: Path,
@@ -323,11 +343,7 @@ def train_and_evaluate(
     이번 실행의 run_id와 다르거나, 학습 없는 구성이거나, `-dirty` 실행이면 거부한다.
     """
     commit = check_git_clean(repo_root, allow_dirty=allow_dirty)
-    run_id = build_run_id(commit, run_config.config_id, run_config.seed)
-    if resume_run_id is not None and not run_config.trainable:
-        raise ValueError(f"구성 {run_config.config_id}는 학습하지 않는 구성이라 재개할 학습이 없습니다: {resume_run_id}")
-    if resume_run_id is not None and resume_run_id != run_id:
-        raise ValueError(f"resume_run_id({resume_run_id})가 이번 실행의 run_id({run_id})와 다릅니다.")
+    run_id = check_resume_request(run_config, commit, resume_run_id)
 
     switches = run_config.switches
     run_meta: dict[str, Any] = {

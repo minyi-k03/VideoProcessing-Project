@@ -128,6 +128,38 @@ def test_weights_are_committed_only_when_requested(repo: Path, tmp_path: Path) -
     assert (run_dir / "weights.pt").read_bytes() == b"weights"
 
 
+def test_committing_weights_does_not_force_in_other_ignored_files(repo: Path, tmp_path: Path) -> None:
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"weights")
+    (repo / ".gitignore").write_text("*.pt\n*.tmp\n", encoding="utf-8")
+    run_dir = write_run_record(repo)
+    (run_dir / "scratch.tmp").write_text("ignored", encoding="utf-8")
+
+    commit_run_record(repo, run_dir, message="with weights", weights_path=weights, **IDENTITY)
+
+    files = committed_files(repo)
+    assert f"results/runs/{RUN_ID}/weights.pt" in files
+    assert f"results/runs/{RUN_ID}/scratch.tmp" not in files
+
+
+def test_failed_commit_leaves_no_copied_weights_and_nothing_staged(repo: Path, tmp_path: Path) -> None:
+    weights = tmp_path / "weights.pt"
+    weights.write_bytes(b"weights")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8", newline="\n")  # 커밋을 실패시킨다
+    hook.chmod(0o755)
+    run_dir = write_run_record(repo)
+    head = git(repo, "rev-parse", "HEAD")
+
+    with pytest.raises(RuntimeError):
+        commit_run_record(repo, run_dir, message="m", weights_path=weights, **IDENTITY)
+
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert not (run_dir / "weights.pt").exists()
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+
+
 @pytest.fixture
 def remote(tmp_path: Path, repo: Path) -> Path:
     bare = tmp_path / "remote.git"
@@ -163,6 +195,20 @@ def test_push_failure_raises_push_failed_without_token_and_keeps_the_commit(repo
 
     assert FAKE_TOKEN not in str(error.value)
     assert git(repo, "rev-parse", "HEAD") == sha  # 커밋은 로컬에 남아 내려받아 커밋하는 대체 경로가 가능하다
+
+
+def test_recommitting_an_already_committed_record_reuses_the_commit_so_push_can_be_retried(
+    repo: Path, remote: Path
+) -> None:
+    """push가 실패해 커밋 셀을 다시 실행해도 막히지 않고, 새 커밋 없이 같은 커밋을 돌려준다."""
+    run_dir = write_run_record(repo)
+    first = commit_run_record(repo, run_dir, message="results", **IDENTITY)
+
+    second = commit_run_record(repo, run_dir, message="results", **IDENTITY)
+
+    assert second == first == git(repo, "rev-parse", "HEAD")
+    push_branch(repo, "work", username="someone", token=FAKE_TOKEN)
+    assert git(remote, "rev-parse", "work") == first
 
 
 def test_push_failure_message_masks_a_token_echoed_by_git(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -57,8 +57,9 @@ def test_find_data_root_rejects_missing_and_ambiguous_pools(tmp_path: Path) -> N
         find_data_root(tmp_path / "empty")
     for name in ("one", "two"):
         extract_data_archive(make_archive(tmp_path / f"{name}.zip"), tmp_path / "both" / name)
-    with pytest.raises(ValueError, match="둘 이상"):
+    with pytest.raises(ValueError, match="둘 이상") as error:
         find_data_root(tmp_path / "both")
+    assert str(tmp_path) not in str(error.value)  # Kaggle Dataset 경로가 노트북 출력에 남지 않게 경로는 싣지 않는다
 
 
 def test_sha256_of_matches_hashlib(tmp_path: Path) -> None:

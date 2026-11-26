@@ -48,7 +48,10 @@ def find_data_root(path: Path) -> Path:
     if not roots:
         raise FileNotFoundError(f"{path} 아래에서 {POOL_DIRNAME}/{METADATA_FILENAME}을 찾지 못했습니다.")
     if len(roots) > 1:
-        raise ValueError(f"{path} 아래에 패치 풀이 둘 이상 있습니다(하나만 두세요): {sorted(str(r) for r in roots)}")
+        # 경로는 싣지 않는다(Kaggle Dataset 경로가 노트북 출력에 남지 않도록).
+        raise ValueError(
+            f"--data-dir 아래에 패치 풀이 둘 이상({len(roots)}개) 있습니다. Dataset을 하나만 붙이거나 --data-dir을 그 폴더로 좁히세요."
+        )
     return roots[0]
 
 
