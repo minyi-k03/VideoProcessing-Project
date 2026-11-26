@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import tempfile
@@ -28,6 +29,7 @@ from sr_pipeline.common.bicubic import bicubic_resize
 from sr_pipeline.common.seed import create_data_rng, set_model_seed
 from sr_pipeline.data.dataset import PatchPoolDataset, read_patch_pool_id
 from sr_pipeline.data.sampler import SeededEpochPatchSampler, check_augmentation
+from sr_pipeline.diagnosis.provenance import SR_GENERATION_SETTINGS_FILENAME
 from sr_pipeline.evaluation.postprocess import quantize_and_shave
 from sr_pipeline.losses.sr_loss import SRLoss
 from sr_pipeline.models.espcn import ESPCN, SCALE
@@ -204,6 +206,7 @@ def _write_sr_images(
     sr_fn: Callable[[torch.Tensor], torch.Tensor],
     *,
     device: torch.device,
+    generation_commit: str | None = None,
 ) -> dict[str, int]:
     """테스트셋 LR 영상을 `sr_fn`으로 변환해 `<sr_dir>/<데이터셋>/<image_id>.png`에 원자적으로 저장합니다."""
     sr_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -221,6 +224,9 @@ def _write_sr_images(
                     sr_uint8 = (sr * 255.0).round().to(torch.uint8)[0].permute(1, 2, 0).cpu().numpy()
                     Image.fromarray(sr_uint8).save(staging / name / path.name)
                 counts[name] = len(images)
+        if generation_commit is not None:
+            with (staging / SR_GENERATION_SETTINGS_FILENAME).open("w", encoding="utf-8") as file:
+                json.dump({"commit": generation_commit}, file)
         staging.rename(sr_dir)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -262,6 +268,7 @@ def generate_bicubic_sr_results(
     dataset_names: Sequence[str],
     *,
     device: str,
+    generation_commit: str | None = None,
 ) -> dict[str, int]:
     """테스트셋 LR 영상을 공용 bicubic 보간(x4)으로 확대해 파일럿 진단용 SR 결과 PNG를 만듭니다.
 
@@ -278,4 +285,5 @@ def generate_bicubic_sr_results(
         sr_dir,
         lambda lr: bicubic_resize(lr, float(SCALE)),
         device=torch.device(device),
+        generation_commit=generation_commit,
     )

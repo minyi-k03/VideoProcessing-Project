@@ -12,6 +12,7 @@ from pathlib import Path
 
 # 결과에 영향을 주는 코드·설정 경로. results/는 진단·학습 결과가 생기는 곳이라 확인하지 않는다.
 CODE_PATHS = ("src", "scripts", "configs")
+SR_GENERATION_SETTINGS_FILENAME = "sr_generation_settings.json"
 
 
 def _git(repo_root: Path, *args: str) -> str:
