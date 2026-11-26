@@ -1,0 +1,13 @@
+{
+  "edge_top_q": 20.0,
+  "shave_border": 4,
+  "datasets": [
+    "Set5",
+    "Set14",
+    "BSD100",
+    "Urban100"
+  ],
+  "model_diagnosis_commit": "f7189d57086e6d22942b33dc93772b7dc5d93a49",
+  "reference_diagnosis_commit": "a6d540900b7a4632a04cba4f249b6f0f09789b31",
+  "commit": "b09ee13b7a49025cd77e944e23987553f2997c88"
+}
