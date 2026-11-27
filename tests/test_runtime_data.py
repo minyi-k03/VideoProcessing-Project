@@ -147,3 +147,25 @@ def test_extract_rejects_archive_without_pool_metadata(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="patch_pool/metadata.json"):
         extract_data_archive(archive, tmp_path / "data")
     assert not (tmp_path / "data").exists()
+
+
+def test_extract_refuses_reuse_when_same_pool_id_archive_differs_in_testsets(tmp_path: Path) -> None:
+    """패치 풀 ID가 같더라도 테스트셋 등 압축 내용이 다른 ZIP이면 기존 해제본을 재사용하지 않는다."""
+    data_dir = tmp_path / "data"
+    first = make_archive(tmp_path / "first.zip", pool_id="pool_a", extra={"testsets/Set5/HR/a.png": b"old"})
+    second = make_archive(tmp_path / "second.zip", pool_id="pool_a", extra={"testsets/Set5/HR/a.png": b"new"})
+    extract_data_archive(first, data_dir)
+
+    with pytest.raises(ValueError, match="테스트셋"):
+        extract_data_archive(second, data_dir)
+    assert (data_dir / "testsets" / "Set5" / "HR" / "a.png").read_bytes() == b"old"
+
+
+def test_extract_refuses_reuse_when_archive_marker_is_missing(tmp_path: Path) -> None:
+    archive = make_archive(tmp_path / "pool.zip", pool_id="pool_a")
+    data_dir = tmp_path / "data"
+    extract_data_archive(archive, data_dir)
+    (data_dir / ".archive_sha256").unlink()
+
+    with pytest.raises(ValueError, match="기존 해제본"):
+        extract_data_archive(archive, data_dir)

@@ -7,6 +7,7 @@ remote URL·`.git/config`·명령행·출력·예외 메시지 어디에도 남�
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import stat
@@ -20,6 +21,7 @@ REQUIRED_RECORD_FILES = ("summary.csv", "per_image.csv")
 TRAIN_LOG_FILENAME = "train_log.json"  # 학습하는 구성에만 있다(Bicubic 하한에는 없다).
 WEIGHTS_FILENAME = "weights.pt"
 _MASK = "***"
+_TRACE_ENV_PREFIXES = ("GIT_TRACE", "GIT_CURL_VERBOSE", "GCM_TRACE")
 _ASKPASS_SCRIPT = r"""#!/bin/sh
 case "$1" in
   Username*) printf '%s\n' "$SR_PUSH_USER";;
@@ -111,6 +113,13 @@ def _nothing_staged(repo_root: Path, relative: str) -> bool:
     return result.returncode == 0
 
 
+def _sanitize_secret_text(text: str, *, username: str, token: str) -> str:
+    """오류 메시지에서 토큰 원문과 Basic 인증(base64) 문자열을 가린다."""
+    basic_auth = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    sanitized = text.replace(token, _MASK).replace(basic_auth, _MASK)
+    return sanitized
+
+
 def push_branch(repo_root: Path, branch: str, *, username: str, token: str, remote: str = "origin") -> None:
     """`branch`를 `remote`에 push한다. 실패하면 토큰을 가린 메시지로 `PushFailed`."""
     if not username or not token:
@@ -120,25 +129,34 @@ def push_branch(repo_root: Path, branch: str, *, username: str, token: str, remo
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as file:  # Windows에서도 CRLF 없이 쓴다
             file.write(_ASKPASS_SCRIPT)
         os.chmod(askpass_path, stat.S_IRWXU)
+        # 호출 환경의 Git 추적 설정(GIT_TRACE*, GIT_CURL_VERBOSE, GCM_TRACE*)이 인증 정보를 남기지 않도록 제거한다.
+        base_env = {k: v for k, v in os.environ.items() if not k.startswith(_TRACE_ENV_PREFIXES)}
         env = {
-            **os.environ,
+            **base_env,
             "GIT_ASKPASS": askpass_path,
             "GIT_TERMINAL_PROMPT": "0",
             "SR_PUSH_USER": username,
             "SR_PUSH_TOKEN": token,
         }
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "-c", "credential.helper=", "push", remote, branch],
-            env=env, capture_output=True, text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "-c", "credential.helper=", "push", remote, branch],
+                env=env, capture_output=True, text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = _sanitize_secret_text(str(error), username=username, token=token)
+            raise PushFailed(
+                f"{remote}에 {branch}를 push하지 못했습니다(커밋은 로컬에 남아 있습니다). "
+                f"실행 기록을 내려받아 로컬에서 커밋하세요(ADR-0005 대체 경로): {detail}"
+            ) from None
     finally:
         Path(askpass_path).unlink(missing_ok=True)
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).replace(token, _MASK).strip()
+        detail = _sanitize_secret_text((result.stderr or result.stdout).strip(), username=username, token=token)
         raise PushFailed(
             f"{remote}에 {branch}를 push하지 못했습니다(커밋은 로컬에 남아 있습니다). "
             f"실행 기록을 내려받아 로컬에서 커밋하세요(ADR-0005 대체 경로): {detail}"
-        )
+        ) from None
 
 
 def bundle_run_record(run_dir: Path, dest_zip: Path) -> Path:

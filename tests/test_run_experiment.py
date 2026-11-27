@@ -298,3 +298,47 @@ def test_help_lists_the_path_arguments(cli: ModuleType, capsys: pytest.CaptureFi
     help_text = capsys.readouterr().out
     for option in ("--data-dir", "--data-archive", "--checkpoint-dir", "--output-dir", "--resume-run-id", "--allow-dirty"):
         assert option in help_text
+
+
+def test_default_results_runs_dir_rejects_non_default_configs(
+    cli: ModuleType, tmp_path: Path, fair_path: Path, archive: Path
+) -> None:
+    """저장소의 기본 `results/runs/` 경로에는 점검용 `--fair-config`나 별도 `--experiments-config`를 쓸 수 없다."""
+    argv = [
+        "--config", "baseline", "--seed", "0", "--device", "cpu",
+        "--fair-config", str(fair_path),
+        "--data-dir", str(tmp_path / "local_data"),
+        "--data-archive", str(archive),
+        "--checkpoint-dir", str(tmp_path / "ckpt"),
+    ]
+    with pytest.raises(ValueError, match="results/runs/"):
+        cli.main(argv)
+    assert not (tmp_path / "local_data").exists()
+
+    custom_exp = tmp_path / "experiments.yaml"
+    custom_exp.write_text((REPO_ROOT / "configs" / "experiments.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ValueError, match="results/runs/"):
+        cli.main([
+            "--config", "baseline", "--seed", "0", "--device", "cpu",
+            "--experiments-config", str(custom_exp),
+            "--output-dir", str(REPO_ROOT / "results" / "runs" / "sub"),
+            "--data-dir", str(tmp_path / "local_data"),
+            "--data-archive", str(archive),
+            "--checkpoint-dir", str(tmp_path / "ckpt"),
+        ])
+
+
+def test_bicubic_rejects_mismatched_patch_pool_id(
+    cli: ModuleType, tmp_path: Path, fair_path: Path, archive: Path
+) -> None:
+    """학습하지 않는 Bicubic 하한도 입력 데이터의 실제 `patch_pool_id`가 설정과 다르면 거부한다."""
+    data_dir = tmp_path / "prepared"
+    extract_data_archive(archive, data_dir)
+    meta_path = data_dir / "patch_pool" / "metadata.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["patch_pool_id"] = "other_pool"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="patch_pool_id"):
+        cli.main(args_for(tmp_path, fair_path, config="bicubic", data_dir=data_dir))
+    assert not (tmp_path / "records").exists()

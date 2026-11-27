@@ -244,3 +244,35 @@ def test_bundle_run_record_zips_the_folder_with_relative_paths(repo: Path, tmp_p
             f"{RUN_ID}/train_log.json",
             f"{RUN_ID}/images/Set5/a_median.png",
         }
+
+
+def test_push_branch_strips_trace_env_and_masks_basic_auth_and_subprocess_errors(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import base64
+    import sr_pipeline.engine.publish as publish
+
+    seen_envs: list[dict[str, str]] = []
+    basic_b64 = base64.b64encode(f"someone:{FAKE_TOKEN}".encode("utf-8")).decode("ascii")
+    for key in ("GIT_TRACE", "GIT_TRACE_CURL", "GIT_CURL_VERBOSE", "GCM_TRACE"):
+        monkeypatch.setenv(key, "1")
+
+    def tracing_run(cmd, *args, **kwargs):
+        seen_envs.append(kwargs["env"])
+        return subprocess.CompletedProcess(cmd, 1, "", f"Authorization: Basic {basic_b64}")
+
+    monkeypatch.setattr(publish.subprocess, "run", tracing_run)
+    with pytest.raises(PushFailed) as error:
+        push_branch(repo, "work", username="someone", token=FAKE_TOKEN)
+    assert basic_b64 not in str(error.value) and "***" in str(error.value)
+    for key in ("GIT_TRACE", "GIT_TRACE_CURL", "GIT_CURL_VERBOSE", "GCM_TRACE"):
+        assert key not in seen_envs[0]
+
+    def exploding_run(cmd, *args, **kwargs):
+        raise OSError(f"subprocess error {FAKE_TOKEN}")
+
+    monkeypatch.setattr(publish.subprocess, "run", exploding_run)
+    with pytest.raises(PushFailed) as exc_info:
+        push_branch(repo, "work", username="someone", token=FAKE_TOKEN)
+    assert FAKE_TOKEN not in str(exc_info.value) and "***" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None

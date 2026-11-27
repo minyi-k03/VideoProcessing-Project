@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from sr_pipeline.data.prepare import METADATA_FILENAME, POOL_DIRNAME
 
 _POOL_METADATA_MEMBER = f"{POOL_DIRNAME}/{METADATA_FILENAME}"
+ARCHIVE_MARKER_FILENAME = ".archive_sha256"
 MAX_SEARCH_DEPTH = 4  # Kaggle은 /kaggle/input/datasets/<유저>/<slug>처럼 몇 단계를 더 감싼다.
 
 
@@ -75,11 +76,13 @@ def extract_data_archive(archive: Path, data_dir: Path, *, expected_sha256: str 
     """압축 파일을 `data_dir`에 풀고 데이터 루트(`data_dir`)를 돌려준다.
 
     - `expected_sha256`이 있으면 풀기 전에 압축 파일 해시를 확인한다(Drive 대체 경로의 `gdown` 내려받기 검증).
-    - `data_dir`에 같은 패치 풀이 이미 풀려 있으면 다시 풀지 않고 재사용한다(세션 재시작). 다른 풀이면 섞이지 않게 거부한다.
+    - `data_dir`에 같은 압축 파일(패치 풀·테스트셋 포함)이 이미 풀려 있으면 다시 풀지 않고 재사용한다(세션 재시작).
+      다른 풀이나 내용이 다른 압축 파일이면 섞이지 않게 거부한다.
     - 옆의 `<data_dir>.partial`에 다 푼 뒤 이름을 바꾸므로 실패해도 반쪽 `data_dir`이 남지 않는다.
     """
     archive, data_dir = Path(archive), Path(data_dir)
-    if expected_sha256 is not None and sha256_of(archive) != expected_sha256.strip().lower():
+    actual_sha256 = sha256_of(archive)
+    if expected_sha256 is not None and actual_sha256 != expected_sha256.strip().lower():
         raise ValueError("압축 파일의 sha256이 기대값과 다릅니다. 내려받은 파일이 원본과 다르니 다시 받으세요.")
     with zipfile.ZipFile(archive) as zf:
         _check_member_names(zf)
@@ -90,6 +93,12 @@ def extract_data_archive(archive: Path, data_dir: Path, *, expected_sha256: str 
             if existing_id != pool_id:
                 raise ValueError(
                     f"{data_dir}에 이미 다른 패치 풀({existing_id})이 있어 {pool_id}를 풀 수 없습니다. 다른 --data-dir을 쓰세요."
+                )
+            marker = data_dir / ARCHIVE_MARKER_FILENAME
+            if not marker.is_file() or marker.read_text(encoding="utf-8").strip().lower() != actual_sha256:
+                raise ValueError(
+                    f"{data_dir}의 기존 해제본이 현재 압축 파일과 같다고 확인할 수 없습니다"
+                    "(패치 풀 ID는 같지만 테스트셋 등 압축 내용이 다를 수 있음). 비어 있는 --data-dir을 쓰세요."
                 )
             return data_dir
         if data_dir.exists() and any(data_dir.iterdir()):
@@ -102,6 +111,7 @@ def extract_data_archive(archive: Path, data_dir: Path, *, expected_sha256: str 
             staging.mkdir(parents=True)
             for member in zf.namelist():
                 zf.extract(member, staging)
+            (staging / ARCHIVE_MARKER_FILENAME).write_text(actual_sha256 + "\n", encoding="utf-8")
             if data_dir.exists():
                 data_dir.rmdir()  # 비어 있는 폴더만 여기까지 온다
             staging.replace(data_dir)

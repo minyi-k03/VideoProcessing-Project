@@ -25,7 +25,7 @@ import torch
 
 from sr_pipeline.common.seed import set_model_seed
 from sr_pipeline.config.schema import ResolvedRunConfig, Switches
-from sr_pipeline.data.dataset import PatchPoolDataset
+from sr_pipeline.data.dataset import PatchPoolDataset, read_patch_pool_id
 from sr_pipeline.data.sampler import SeededEpochPatchSampler, check_augmentation
 from sr_pipeline.diagnosis.provenance import resolve_code_commit
 from sr_pipeline.evaluation.benchmark import count_parameters
@@ -344,6 +344,12 @@ def train_and_evaluate(
     """
     commit = check_git_clean(repo_root, allow_dirty=allow_dirty)
     run_id = check_resume_request(run_config, commit, resume_run_id)
+    expected_pool_id = run_config.fair_comparison["pilot_determined"]["patch_pool_id"]
+    actual_pool_id = read_patch_pool_id(data_dir)
+    if actual_pool_id != expected_pool_id:
+        raise ValueError(
+            f"입력 데이터의 patch_pool_id({actual_pool_id!r})가 설정의 patch_pool_id({expected_pool_id!r})와 다릅니다."
+        )
 
     switches = run_config.switches
     run_meta: dict[str, Any] = {

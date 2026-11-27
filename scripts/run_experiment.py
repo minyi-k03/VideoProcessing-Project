@@ -17,6 +17,7 @@ import pandas as pd
 import torch
 
 from sr_pipeline.config.schema import resolve_run_config
+from sr_pipeline.data.dataset import read_patch_pool_id
 from sr_pipeline.engine.runtime_data import extract_data_archive, find_data_root
 from sr_pipeline.engine.trainer import check_git_clean, check_resume_request, train_and_evaluate
 
@@ -51,8 +52,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _check_output_target(args: argparse.Namespace) -> None:
+    """저장소의 기본 실행 기록 폴더(`results/runs/`)에는 저장소 기본 설정을 쓴 실행만 허용한다."""
+    default_runs = DEFAULT_OUTPUT_DIR.resolve()
+    output_dir = Path(args.output_dir).resolve()
+    if output_dir == default_runs or default_runs in output_dir.parents:
+        if (
+            Path(args.fair_config).resolve() != DEFAULT_FAIR_CONFIG.resolve()
+            or Path(args.experiments_config).resolve() != DEFAULT_EXPERIMENTS_CONFIG.resolve()
+        ):
+            raise ValueError(
+                "기본 실행 기록 폴더(results/runs/)에는 저장소의 configs/fair_comparison.yaml과 "
+                "configs/experiments.yaml을 쓴 실행만 저장할 수 있습니다. 점검용 설정은 다른 --output-dir을 지정하세요."
+            )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    _check_output_target(args)
     run_config = resolve_run_config(args.fair_config, args.experiments_config, args.config, args.seed)
     # 압축 파일을 풀기 전에 빠르게 거부: 커밋 안 된 코드 변경, 이어 갈 수 없는 재개 요청
     commit = check_git_clean(REPO_ROOT, allow_dirty=args.allow_dirty)
@@ -61,6 +78,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.data_archive is not None:
         extract_data_archive(args.data_archive, args.data_dir, expected_sha256=args.archive_sha256)
     data_root = find_data_root(args.data_dir)
+    actual_pool_id = read_patch_pool_id(data_root)
+    expected_pool_id = run_config.fair_comparison["pilot_determined"]["patch_pool_id"]
+    if actual_pool_id != expected_pool_id:
+        raise ValueError(
+            f"입력 데이터의 patch_pool_id({actual_pool_id!r})가 설정의 patch_pool_id({expected_pool_id!r})와 다릅니다."
+        )
 
     run_dir = train_and_evaluate(
         run_config,
