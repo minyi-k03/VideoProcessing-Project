@@ -921,7 +921,17 @@ def _load_experiments_metadata(path: Path) -> tuple[list[str], list[str], dict[s
     return order, promoted, configs
 
 
-def _load_train_logs(runs_dir: Path, run_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+def _load_train_logs(
+    runs_dir: Path,
+    run_ids: Iterable[str],
+    *,
+    summary_df: pd.DataFrame | None = None,
+) -> dict[str, dict[str, Any]]:
+    expected_meta: dict[str, tuple[str, str, int]] = {}
+    if summary_df is not None and not summary_df.empty:
+        for row in summary_df[["run_id", "patch_pool_id", "config_id", "seed"]].drop_duplicates().itertuples(index=False):
+            expected_meta[str(row.run_id)] = (str(row.patch_pool_id), str(row.config_id), int(row.seed))
+
     logs: dict[str, dict[str, Any]] = {}
     for run_id in sorted(set(run_ids)):
         path = runs_dir / run_id / "train_log.json"
@@ -930,6 +940,20 @@ def _load_train_logs(runs_dir: Path, run_ids: Iterable[str]) -> dict[str, dict[s
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError(f"{path}는 JSON 객체여야 합니다.")
+        if payload.get("run_id") is not None and str(payload["run_id"]) != str(run_id):
+            raise ValueError(f"{path}의 run_id({payload['run_id']!r})가 폴더 이름({run_id!r})과 다릅니다.")
+        if run_id in expected_meta:
+            exp_pool, exp_cfg, exp_seed = expected_meta[run_id]
+            if payload.get("patch_pool_id") is not None and str(payload["patch_pool_id"]) != exp_pool:
+                raise ValueError(
+                    f"{path}의 patch_pool_id({payload['patch_pool_id']!r})가 summary.csv({exp_pool!r})와 다릅니다."
+                )
+            if payload.get("config_id") is not None and str(payload["config_id"]) != exp_cfg:
+                raise ValueError(
+                    f"{path}의 config_id({payload['config_id']!r})가 summary.csv({exp_cfg!r})와 다릅니다."
+                )
+            if payload.get("seed") is not None and int(payload["seed"]) != exp_seed:
+                raise ValueError(f"{path}의 seed({payload['seed']!r})가 summary.csv({exp_seed!r})와 다릅니다.")
         logs[run_id] = payload
     return logs
 
@@ -984,6 +1008,14 @@ def _pyplot():
     return plt
 
 
+def _win_fraction(deltas: np.ndarray, *, metric: str) -> float:
+    """순위 가능한 Δ(유한값 및 `±inf`, `NaN` 제외) 전체에서 개선 방향 비율을 계산합니다."""
+    valid = deltas[~np.isnan(deltas)]
+    if len(valid) == 0:
+        return math.nan
+    return float(np.mean(valid < 0 if metric in LOWER_IS_BETTER_METRICS else valid > 0))
+
+
 def _plot_per_image_delta_distributions(
     per_image_summary: pd.DataFrame,
     figures_dir: Path,
@@ -1011,24 +1043,33 @@ def _plot_per_image_delta_distributions(
             configs = [c for c in config_order if c in set(ds_df["config_id"])]
             if not configs:
                 configs = sorted(ds_df["config_id"].unique())
-            series_list = [
+            raw_series = [
                 ds_df.loc[ds_df["config_id"] == cfg, "mean_delta"].dropna().to_numpy(dtype=float) for cfg in configs
             ]
-            series_list = [s[np.isfinite(s)] for s in series_list]
-            if not any(len(s) for s in series_list):
+            if not any(len(s) for s in raw_series):
                 continue
+            finite_series = [s[np.isfinite(s)] for s in raw_series]
 
             fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * len(configs) + 1.5), 4.5))
-            ax.boxplot(series_list, showfliers=False)
+            if any(len(s) for s in finite_series):
+                ax.boxplot(finite_series, showfliers=False)
+            else:
+                ax.set_xlim(0.5, len(configs) + 0.5)
+                ax.set_ylim(-1.0, 1.0)
             ax.set_xticks(range(1, len(configs) + 1), configs)
             rng = np.random.default_rng(0)
-            for idx, (cfg, vals) in enumerate(zip(configs, series_list), start=1):
-                if len(vals) == 0:
+            for idx, (cfg, raw_vals, vals) in enumerate(zip(configs, raw_series, finite_series), start=1):
+                if len(raw_vals) == 0:
                     continue
-                jitter = rng.uniform(-0.15, 0.15, size=len(vals))
-                ax.scatter(np.full(len(vals), idx) + jitter, vals, s=14, alpha=0.55)
-                win_frac = float(np.mean(vals < 0 if metric in LOWER_IS_BETTER_METRICS else vals > 0))
-                ax.text(idx, float(np.max(vals)), f"{win_frac:.0%}", ha="center", va="bottom", fontsize=8)
+                if len(vals) > 0:
+                    jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+                    ax.scatter(np.full(len(vals), idx) + jitter, vals, s=14, alpha=0.55)
+                    y_text = float(np.max(vals))
+                else:
+                    y_text = 0.0
+                win_frac = _win_fraction(raw_vals, metric=metric)
+                if not math.isnan(win_frac):
+                    ax.text(idx, y_text, f"{win_frac:.0%}", ha="center", va="bottom", fontsize=8)
             ax.axhline(0.0, color="gray", linestyle="--", linewidth=1.0)
             ax.set_ylabel(f"Per-image delta ({metric})")
             title_pool = f" [{pool}]" if is_multi_pool and pool else ""
@@ -1054,12 +1095,20 @@ def _plot_learning_curves(
         cfg = log.get("config_id")
         losses = log.get("epoch_losses")
         if cfg and isinstance(losses, list) and losses:
-            pool = str(log.get("patch_pool_id") or (run_to_pool or {}).get(str(run_id), ""))
+            log_pool = log.get("patch_pool_id")
+            summary_pool = (run_to_pool or {}).get(str(run_id))
+            if summary_pool is not None and log_pool is not None and str(log_pool) != summary_pool:
+                raise ValueError(
+                    f"실행 {run_id}의 train_log.json patch_pool_id({log_pool!r})가 summary.csv({summary_pool!r})와 다릅니다."
+                )
+            pool = summary_pool if summary_pool is not None else str(log_pool or "")
             by_pool.setdefault(pool, {}).setdefault(str(cfg), []).append([float(x) for x in losses])
     if not by_pool:
         return []
 
     is_multi_pool = (len(by_pool) > 1) if multi_pool is None else multi_pool
+    if len(by_pool) > 1 and not is_multi_pool:
+        raise ValueError(f"패치 풀 {sorted(by_pool)}이 둘 이상인데 단일 학습 곡선 파일로 덮어쓸 수 없습니다.")
     created: list[str] = []
     for pool in sorted(by_pool):
         by_cfg = by_pool[pool]
@@ -1333,7 +1382,7 @@ def _render_case_study_figures(
             & (per_image_seed_deltas["metric"] == metric)
         ].sort_values("seed")
 
-        chosen_pair: tuple[int, str, str, ESPCN, ESPCN] | None = None
+        chosen_pair: tuple[int, str, str, float, ESPCN, ESPCN] | None = None
         missing_details: list[str] = []
         for pair in paired_rows.itertuples(index=False):
             seed_val = int(pair.seed)
@@ -1342,7 +1391,7 @@ def _render_case_study_figures(
             t_model = _get_model(cfg, t_run_id)
             b_model = _get_model(BASELINE_CONFIG_ID, b_run_id)
             if t_model is not None and b_model is not None:
-                chosen_pair = (seed_val, t_run_id, b_run_id, t_model, b_model)
+                chosen_pair = (seed_val, t_run_id, b_run_id, float(pair.delta), t_model, b_model)
                 break
             missing_sides: list[str] = []
             if t_model is None:
@@ -1399,7 +1448,7 @@ def _render_case_study_figures(
             )
             continue
 
-        seed_val, target_run_id, baseline_run_id, target_model, base_model = chosen_pair
+        seed_val, target_run_id, baseline_run_id, seed_delta, target_model, base_model = chosen_pair
         sample = ds[id_map[image_id]]
         lr, hr = sample["lr"], sample["hr"]
         hr_u8 = _display_u8(hr)
@@ -1424,7 +1473,8 @@ def _render_case_study_figures(
         pool_prefix = f"{pool}_" if multi_pool else ""
         comp_name = f"case_study_comparison_{pool_prefix}{cfg}_{ds_name}_{image_id}_{case_type}.png"
         err_name = f"case_study_error_maps_{pool_prefix}{cfg}_{ds_name}_{image_id}_{case_type}.png"
-        delta_str = _format_signed_delta(float(row.mean_delta))
+        seed_delta_str = _format_signed_delta(seed_delta)
+        mean_delta_str = _format_signed_delta(float(row.mean_delta))
         _render_multi_config_panels(
             panels,
             hr_u8,
@@ -1432,7 +1482,7 @@ def _render_case_study_figures(
             shave_border=shave_border,
             comparison_path=figures_dir / comp_name,
             error_maps_path=figures_dir / err_name,
-            title=f"{ds_name} {image_id} ({cfg} {case_type}, seed={seed_val}, delta={delta_str} dB)",
+            title=f"{ds_name} {image_id} ({cfg} {case_type}, seed={seed_val} delta={seed_delta_str} dB, mean delta={mean_delta_str} dB)",
         )
         created.extend([comp_name, err_name])
         rendered_records.append(
@@ -1445,6 +1495,8 @@ def _render_case_study_figures(
                 "image_id": image_id,
                 "case_type": case_type,
                 "seed": seed_val,
+                "seed_delta": seed_delta,
+                "mean_delta": float(row.mean_delta),
                 "run_id": target_run_id,
                 "baseline_run_id": baseline_run_id,
             }
@@ -1478,7 +1530,7 @@ def export_report_assets(
     formatted_results = format_result_report_table(result_tables["results"])
     ablation_df = build_ablation_table(summary_df, expected_seeds=expected_seeds)
     per_image_tables = compute_per_image_deltas(summary_df, per_image_df, expected_seeds=expected_seeds)
-    train_logs = _load_train_logs(runs_dir, summary_df["run_id"].unique())
+    train_logs = _load_train_logs(runs_dir, summary_df["run_id"].unique(), summary_df=summary_df)
     training_times_df = build_training_time_table(summary_df, train_logs=train_logs, max_hours=max_hours)
     progress_df = build_progress_table(
         summary_df,

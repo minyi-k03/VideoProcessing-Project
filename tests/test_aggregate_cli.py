@@ -225,3 +225,64 @@ def test_load_run_records_restricts_to_allowed_run_ids(tmp_path: Path) -> None:
     summary, per_image = load_run_records(runs_dir, allowed_run_ids={"c0-baseline-s0"})
     assert set(summary["run_id"]) == {"c0-baseline-s0"}
     assert set(per_image["run_id"]) == {"c0-baseline-s0"}
+
+
+def test_rejects_skip_worktree_modified_csv_and_config(git_repo: Path, cli: ModuleType) -> None:
+    csv_path = git_repo / "results" / "runs" / "c0-baseline-s0" / "summary.csv"
+    _git(git_repo, "update-index", "--skip-worktree", "results/runs/c0-baseline-s0/summary.csv")
+    csv_path.write_text(csv_path.read_text(encoding="utf-8").replace(",30.0,", ",45.0,"), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="skip-worktree"):
+        cli.main([])
+    assert not (git_repo / "results" / "aggregated" / "tables").exists()
+
+    # CSV를 복구하고 fair_comparison.yaml에만 skip-worktree 변조를 걸어도 거부되어야 한다.
+    _git(git_repo, "update-index", "--no-skip-worktree", "results/runs/c0-baseline-s0/summary.csv")
+    _git(git_repo, "checkout", "--", "results/runs/c0-baseline-s0/summary.csv")
+    fair_path = git_repo / "configs" / "fair_comparison.yaml"
+    _git(git_repo, "update-index", "--skip-worktree", "configs/fair_comparison.yaml")
+    fair_path.write_text(fair_path.read_text(encoding="utf-8").replace("max_hours: 3.0", "max_hours: 99.0"), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="skip-worktree"):
+        cli.main([])
+
+
+def test_rejects_symlink_committed_in_main(git_repo: Path, cli: ModuleType) -> None:
+    # OS symlink 권한 없이도 git index의 120000(symlink) 모드를 재현해 거부되는지 검증한다.
+    target_blob = subprocess.run(
+        ["git", "-C", str(git_repo), "hash-object", "-w", "--stdin"],
+        input="../c0-baseline-s0/summary.csv",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(
+        git_repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"120000,{target_blob},results/runs/c0-link-s0/summary.csv",
+    )
+    _git(git_repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "commit symlink")
+    _git(git_repo, "checkout", "--", "results/runs/c0-link-s0/summary.csv")
+
+    with pytest.raises(RuntimeError, match="일반 파일"):
+        cli.main([])
+
+
+def test_allows_korean_image_filenames_merged_in_main(git_repo: Path, cli: ModuleType) -> None:
+    import numpy as np
+    from PIL import Image
+
+    img_dir = git_repo / "results" / "runs" / "c0-baseline-s0" / "images" / "Set14"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    panel = np.full((16, 48, 3), 120, dtype=np.uint8)
+    Image.fromarray(panel).save(img_dir / "나비_median.png")
+    Image.fromarray(panel).save(img_dir / "나비_median_roi.png")
+    _git(git_repo, "config", "core.quotePath", "true")
+    _git(git_repo, "add", "results/runs")
+    _git(git_repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "add korean image")
+
+    cli.main([])
+
+    assert (git_repo / "results" / "aggregated" / "figures" / "comparison_Set14_나비_median.png").is_file()

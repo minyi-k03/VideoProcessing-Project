@@ -1107,3 +1107,98 @@ class TestExportReportAssets:
         assert (out_dir / "tables" / "case_studies.csv").is_file()
         assert (out_dir / "figures" / "learning_curves.png").is_file()
         assert manifest["run_ids"] == ["c0-A-s0", "c0-baseline-s0"]
+
+    def test_case_study_figure_title_distinguishes_seed_delta_from_mean_delta(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import numpy as np
+        from PIL import Image
+        import sr_pipeline.reporting.aggregate as agg_mod
+        from sr_pipeline.data.prepare import prepare_testsets
+
+        runs_dir = tmp_path / "runs"
+        out_dir = tmp_path / "aggregated"
+        # 시드 0 Δ = +1.0 dB, 시드 1 Δ = +3.0 dB -> 평균 Δ = +2.0 dB (시드 0 그림에는 둘을 구분 표기해야 함).
+        for seed, delta in ((0, 1.0), (1, 3.0)):
+            for cfg, val in (("baseline", 30.0), ("A", 30.0 + delta)):
+                run_id = f"c0-{cfg}-s{seed}"
+                run_dir = runs_dir / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame([_row(cfg, seed, val, dataset="BSD100")], columns=SUMMARY_COLUMNS).to_csv(
+                    run_dir / "summary.csv", index=False
+                )
+                per_img = [
+                    {"run_id": run_id, "dataset": "BSD100", "image_id": "b0", "psnr_y": val,
+                     "ssim_y": 0.9, "psnr_rgb": 28.0, "edge_psnr": 25.0, "lpips": 0.1},
+                    {"run_id": run_id, "dataset": "BSD100", "image_id": "b1", "psnr_y": 30.0,
+                     "ssim_y": 0.9, "psnr_rgb": 28.0, "edge_psnr": 25.0, "lpips": 0.1},
+                ]
+                pd.DataFrame(per_img, columns=PER_IMAGE_COLUMNS).to_csv(run_dir / "per_image.csv", index=False)
+                ckpt_dir = tmp_path / "ckpts" / run_id
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                from sr_pipeline.models.espcn import ESPCN
+                import torch
+                torch.save(ESPCN().state_dict(), ckpt_dir / "weights.pt")
+
+        hr_root = tmp_path / "hr_src"
+        (hr_root / "BSD100").mkdir(parents=True)
+        for img_id in ("b0", "b1"):
+            Image.fromarray(np.full((32, 32, 3), 120, dtype=np.uint8)).save(hr_root / "BSD100" / f"{img_id}.png")
+        data_dir = tmp_path / "data"
+        prepare_testsets(hr_root, data_dir, 4, ["BSD100"], "bicubic", "matlab_imresize_antialias")
+
+        captured_titles: list[str] = []
+        orig_render = agg_mod._render_multi_config_panels
+
+        def _spy_render(*args, **kwargs):
+            captured_titles.append(kwargs["title"])
+            return orig_render(*args, **kwargs)
+
+        monkeypatch.setattr(agg_mod, "_render_multi_config_panels", _spy_render)
+        manifest = export_report_assets(runs_dir, out_dir, data_dir=data_dir, checkpoint_dir=tmp_path / "ckpts")
+
+        b0_rec = [r for r in manifest["case_study_figures"] if r["image_id"] == "b0"][0]
+        assert b0_rec["seed"] == 0
+        assert b0_rec["seed_delta"] == pytest.approx(1.0)
+        assert b0_rec["mean_delta"] == pytest.approx(2.0)
+        b0_title = [t for t in captured_titles if "b0" in t][0]
+        assert "seed=0 delta=+1.000 dB" in b0_title
+        assert "mean delta=+2.000 dB" in b0_title
+
+    def test_distribution_win_fraction_includes_infinite_deltas(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sr_pipeline.reporting.aggregate import _plot_per_image_delta_distributions
+
+        df = pd.DataFrame(
+            [
+                {"patch_pool_id": POOL, "dataset": "BSD100", "config_id": "A", "image_id": "im0", "metric": "psnr_y", "mean_delta": 1.0},
+                {"patch_pool_id": POOL, "dataset": "BSD100", "config_id": "A", "image_id": "im1", "metric": "psnr_y", "mean_delta": -math.inf},
+            ]
+        )
+        texts_seen: list[str] = []
+        import matplotlib.axes
+
+        orig_text = matplotlib.axes.Axes.text
+
+        def _spy_text(self, x, y, s, *args, **kwargs):
+            texts_seen.append(str(s))
+            return orig_text(self, x, y, s, *args, **kwargs)
+
+        monkeypatch.setattr(matplotlib.axes.Axes, "text", _spy_text)
+        files = _plot_per_image_delta_distributions(df, tmp_path, config_order=["A"])
+        assert files == ["per_image_delta_distribution_BSD100.png"]
+        assert texts_seen == ["50%"]
+
+    def test_rejects_mismatched_patch_pool_id_between_train_log_and_summary(self, tmp_path: Path) -> None:
+        import json
+
+        runs_dir = tmp_path / "runs"
+        out_dir = tmp_path / "aggregated"
+        self._write_full_run(runs_dir, "baseline", 0, psnr_shift=0.0, with_images=False)
+        self._write_full_run(runs_dir, "A", 0, psnr_shift=0.5, with_images=False)
+        bad_log_path = runs_dir / "c0-A-s0" / "train_log.json"
+        bad_log = json.loads(bad_log_path.read_text(encoding="utf-8"))
+        bad_log["patch_pool_id"] = "pool_other"
+        bad_log_path.write_text(json.dumps(bad_log), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="patch_pool_id"):
+            export_report_assets(runs_dir, out_dir)
