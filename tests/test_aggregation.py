@@ -690,6 +690,31 @@ class TestPerImageDeltaAndCaseStudies:
         with pytest.raises(ValueError, match="중복"):
             compute_per_image_deltas(summary, per_image_df, expected_seeds=SEEDS)
 
+    def test_case_study_selection_keeps_rankable_infinite_deltas_and_handles_all_nan(self) -> None:
+        summary = _frame([_row("baseline", 0, 30.0), _row("A", 0, 31.0)])
+        per_image_df = pd.DataFrame(
+            _per_image_rows(
+                "c0-baseline-s0",
+                [("im_perfect", 30.0), ("im_finite", 30.0), ("im_regressed", math.inf), ("im_both_inf", math.inf)],
+            )
+            + _per_image_rows(
+                "c0-A-s0",
+                [("im_perfect", math.inf), ("im_finite", 31.0), ("im_regressed", 29.0), ("im_both_inf", math.inf)],
+            ),
+            columns=PER_IMAGE_COLUMNS,
+        )
+        cases = select_case_study_images(per_image_df, "A", summary_df=summary, expected_seeds=SEEDS)
+        assert cases["Set5"]["success"][0]["image_id"] == "im_perfect"
+        assert math.isinf(cases["Set5"]["success"][0]["mean_delta"]) and cases["Set5"]["success"][0]["mean_delta"] > 0
+        assert cases["Set5"]["failure"][0]["image_id"] == "im_regressed"
+        assert math.isinf(cases["Set5"]["failure"][0]["mean_delta"]) and cases["Set5"]["failure"][0]["mean_delta"] < 0
+
+        all_nan_df = pd.DataFrame(
+            _per_image_rows("c0-baseline-s0", [("im_a", math.inf)]) + _per_image_rows("c0-A-s0", [("im_a", math.inf)]),
+            columns=PER_IMAGE_COLUMNS,
+        )
+        assert select_case_study_images(all_nan_df, "A", summary_df=summary, expected_seeds=SEEDS) == {}
+
 
 class TestReportTables:
     def test_formatted_result_table_masks_lpips_exceeds_and_flags_incomplete(self) -> None:
@@ -981,3 +1006,104 @@ class TestExportReportAssets:
         manifest = export_report_assets(runs_dir, out_dir, data_dir=data_dir, checkpoint_dir=tmp_path / "ckpts")
         assert not any(name.startswith("case_study_") for name in manifest["figures"])
         assert "case_study_figures_skipped_reason" in manifest
+        assert manifest["skipped_case_study_figures"]
+
+    def test_export_report_assets_separates_plots_by_patch_pool(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "runs"
+        out_dir = tmp_path / "aggregated"
+        for pool, offset in (("pool_1", 0.0), ("pool_2", 1.0)):
+            for cfg, shift in (("baseline", 0.0), ("A", 0.5)):
+                for seed in SEEDS:
+                    run_id = f"{pool}-{cfg}-s{seed}"
+                    run_dir = runs_dir / run_id
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    rows = []
+                    per_img = []
+                    for ds in ("BSD100", "Urban100"):
+                        r = _row(cfg, seed, 30.0 + offset + shift, dataset=ds, pool=pool, commit=pool)
+                        r["run_id"] = run_id
+                        rows.append(r)
+                        for idx, img_id in enumerate(("im0", "im1")):
+                            per_img.append(
+                                {"run_id": run_id, "dataset": ds, "image_id": img_id,
+                                 "psnr_y": 30.0 + offset + shift + 0.1 * idx, "ssim_y": 0.9,
+                                 "psnr_rgb": 28.0, "edge_psnr": 25.0, "lpips": 0.1}
+                            )
+                    pd.DataFrame(rows, columns=SUMMARY_COLUMNS).to_csv(run_dir / "summary.csv", index=False)
+                    pd.DataFrame(per_img, columns=PER_IMAGE_COLUMNS).to_csv(run_dir / "per_image.csv", index=False)
+                    import json
+                    (run_dir / "train_log.json").write_text(
+                        json.dumps({"run_id": run_id, "config_id": cfg, "seed": seed, "patch_pool_id": pool,
+                                    "epochs_done": 2, "epochs_total": 2, "epoch_losses": [0.2 + offset, 0.1 + offset]}),
+                        encoding="utf-8",
+                    )
+
+        manifest = export_report_assets(runs_dir, out_dir)
+        figures_dir = out_dir / "figures"
+        for pool in ("pool_1", "pool_2"):
+            assert (figures_dir / f"per_image_delta_distribution_{pool}_BSD100.png").is_file()
+            assert (figures_dir / f"per_image_delta_distribution_{pool}_Urban100.png").is_file()
+            assert (figures_dir / f"learning_curves_{pool}.png").is_file()
+        assert "learning_curves.png" not in manifest["figures"]
+        assert "per_image_delta_distribution_BSD100.png" not in manifest["figures"]
+
+    def test_export_report_assets_uses_paired_seed_checkpoints_and_records_skipped(self, tmp_path: Path) -> None:
+        import numpy as np
+        from PIL import Image
+        from sr_pipeline.data.prepare import prepare_testsets
+
+        runs_dir = tmp_path / "runs"
+        out_dir = tmp_path / "aggregated"
+        # baseline은 시드 0, 1 모두 체크포인트가 있고, A는 시드 1만 complete+체크포인트(시드 0은 incomplete).
+        # B는 시드 1만 complete+체크포인트이지만 baseline 시드 1 체크포인트가 없는 상황 대신:
+        # C는 시드 2만 complete(체크포인트 없음) -> 건너뜀 목록에 기록, A는 반드시 시드 1 쌍(c0-A-s1 vs c0-baseline-s1)을 써야 함.
+        self._write_full_run(runs_dir, "baseline", 0, psnr_shift=0.0, with_images=False, with_weights=True)
+        self._write_full_run(runs_dir, "baseline", 1, psnr_shift=0.0, with_images=False, with_weights=True)
+        self._write_full_run(runs_dir, "A", 0, psnr_shift=0.5, status="incomplete", with_images=False, with_weights=True)
+        self._write_full_run(runs_dir, "A", 1, psnr_shift=0.5, status="complete", with_images=False, with_weights=True)
+        self._write_full_run(runs_dir, "C", 1, psnr_shift=0.3, status="complete", with_images=False, with_weights=False)
+
+        hr_root = tmp_path / "hr_src"
+        for ds, ids in (("Set5", ("img0", "img1")), ("BSD100", ("b0", "b1", "b2")), ("Urban100", ("u0", "u1"))):
+            (hr_root / ds).mkdir(parents=True)
+            for idx, img_id in enumerate(ids):
+                arr = np.full((32, 32, 3), 100 + 20 * idx, dtype=np.uint8)
+                arr[8:24, 8:24] = 200
+                Image.fromarray(arr).save(hr_root / ds / f"{img_id}.png")
+        data_dir = tmp_path / "data"
+        prepare_testsets(hr_root, data_dir, 4, ["Set5", "BSD100", "Urban100"], "bicubic", "matlab_imresize_antialias")
+
+        manifest = export_report_assets(runs_dir, out_dir, data_dir=data_dir, checkpoint_dir=tmp_path / "ckpts")
+        rendered_a = [item for item in manifest["case_study_figures"] if item["config_id"] == "A"]
+        assert rendered_a
+        assert all(item["seed"] == 1 for item in rendered_a)
+        assert all(item["run_id"] == "c0-A-s1" for item in rendered_a)
+        assert all(item["baseline_run_id"] == "c0-baseline-s1" for item in rendered_a)
+        skipped_c = [item for item in manifest["skipped_case_study_figures"] if item["config_id"] == "C"]
+        assert skipped_c
+        assert "c0-C-s1" in skipped_c[0]["reason"]
+
+    def test_export_report_assets_handles_all_nan_case_study_deltas(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "runs"
+        out_dir = tmp_path / "aggregated"
+        for cfg in ("baseline", "A"):
+            run_id = f"c0-{cfg}-s0"
+            run_dir = runs_dir / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            row = _row(cfg, 0, math.inf, dataset="BSD100")
+            pd.DataFrame([row], columns=SUMMARY_COLUMNS).to_csv(run_dir / "summary.csv", index=False)
+            per_img = [{"run_id": run_id, "dataset": "BSD100", "image_id": "flat0", "psnr_y": math.inf,
+                        "ssim_y": 1.0, "psnr_rgb": math.inf, "edge_psnr": math.inf, "lpips": 0.0}]
+            pd.DataFrame(per_img, columns=PER_IMAGE_COLUMNS).to_csv(run_dir / "per_image.csv", index=False)
+            import json
+            (run_dir / "train_log.json").write_text(
+                json.dumps({"run_id": run_id, "config_id": cfg, "seed": 0, "patch_pool_id": POOL,
+                            "epochs_done": 1, "epochs_total": 1, "epoch_losses": [0.0]}),
+                encoding="utf-8",
+            )
+
+        manifest = export_report_assets(runs_dir, out_dir)
+        assert (out_dir / "tables" / "results.csv").is_file()
+        assert (out_dir / "tables" / "case_studies.csv").is_file()
+        assert (out_dir / "figures" / "learning_curves.png").is_file()
+        assert manifest["run_ids"] == ["c0-A-s0", "c0-baseline-s0"]

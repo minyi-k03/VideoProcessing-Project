@@ -141,18 +141,32 @@ def _check_columns(df: pd.DataFrame, required: Sequence[str], source: Path) -> N
         raise ValueError(f"{source}에 필요한 열이 없습니다: {missing}")
 
 
-def load_run_records(runs_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_run_records(
+    runs_dir: Path,
+    *,
+    allowed_run_ids: Iterable[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """`runs_dir/<run_id>/{summary,per_image}.csv`를 모두 읽어 (summary, per_image)로 합칩니다.
 
     실행 폴더에 두 파일 중 하나라도 없거나, 파일에 행이 없거나, 필요한 열이 없거나,
     필수 값이 비었거나(빈 값은 `psnr_y_pre_rgb`만 허용), 허용되지 않은 수치(`+inf`는 PSNR 계열 열만 허용,
     `NaN`·`-inf`·비숫자는 모두 거부)가 있거나, `status`가 알 수 없는 값이면 집계 전에 `ValueError`로 멈춘다.
+    `allowed_run_ids`를 주면 그 목록(예: `main`에 병합된 실행)에 속한 폴더만 읽는다.
     중복 검사는 `validate_unique_runs`가 한다.
     "main에 병합된 기록만"이라는 조건은 T6.3 집계 스크립트(`scripts/aggregate_results.py`)에서 검증한다.
     """
     runs_dir = Path(runs_dir)
+    allowed_set = None if allowed_run_ids is None else {str(r) for r in allowed_run_ids}
     run_dirs = (
-        sorted({p.parent for name in (SUMMARY_FILENAME, PER_IMAGE_FILENAME) for p in runs_dir.glob(f"*/{name}")})
+        sorted(
+            d
+            for d in {
+                p.parent
+                for name in (SUMMARY_FILENAME, PER_IMAGE_FILENAME)
+                for p in runs_dir.glob(f"*/{name}")
+            }
+            if allowed_set is None or d.name in allowed_set
+        )
         if runs_dir.is_dir()
         else []
     )
@@ -577,12 +591,14 @@ def select_case_study_images(
     )
     if datasets is not None:
         table = table[table["dataset"].isin(list(datasets))]
-    table = table[np.isfinite(table["mean_delta"])].copy()
-    if table.empty:
-        raise ValueError(f"구성 {config_id!r}({metric})에 대해 사례 영상을 고를 유효한 영상별 Δ가 없습니다.")
     pools = sorted(table["patch_pool_id"].unique())
     if len(pools) > 1:
         raise ValueError(f"서로 다른 패치 풀 {pools}이 섞여 있어 사례 영상을 한꺼번에 고를 수 없습니다.")
+    # +inf/-inf(완전 복원 또는 베이스라인 완전 복원 대비 차이)는 순위를 매길 수 있으므로 유지하고,
+    # +inf - +inf 등으로 정의되지 않은 NaN만 제외한다. 순위를 매길 수 있는 후보가 없으면 빈 결과를 반환한다.
+    table = table[table["mean_delta"].notna()].copy()
+    if table.empty:
+        return {}
 
     direction = -1.0 if metric in LOWER_IS_BETTER_METRICS else 1.0
     table["_score"] = direction * table["mean_delta"].astype(float)
@@ -975,6 +991,7 @@ def _plot_per_image_delta_distributions(
     config_order: Sequence[str],
     datasets: Sequence[str] = DEFAULT_DISTRIBUTION_DATASETS,
     metric: str = "psnr_y",
+    multi_pool: bool | None = None,
 ) -> list[str]:
     plt = _pyplot()
     created: list[str] = []
@@ -982,38 +999,44 @@ def _plot_per_image_delta_distributions(
         return created
 
     sub = per_image_summary[per_image_summary["metric"] == metric]
-    for dataset in datasets:
-        ds_df = sub[sub["dataset"] == dataset]
-        if ds_df.empty:
-            continue
-        configs = [c for c in config_order if c in set(ds_df["config_id"])]
-        if not configs:
-            configs = sorted(ds_df["config_id"].unique())
-        series_list = [
-            ds_df.loc[ds_df["config_id"] == cfg, "mean_delta"].dropna().to_numpy(dtype=float) for cfg in configs
-        ]
-        series_list = [s[np.isfinite(s)] for s in series_list]
-        if not any(len(s) for s in series_list):
-            continue
-
-        fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * len(configs) + 1.5), 4.5))
-        ax.boxplot(series_list, showfliers=False)
-        ax.set_xticks(range(1, len(configs) + 1), configs)
-        rng = np.random.default_rng(0)
-        for idx, (cfg, vals) in enumerate(zip(configs, series_list), start=1):
-            if len(vals) == 0:
+    pools = sorted(sub["patch_pool_id"].unique())
+    is_multi_pool = (len(pools) > 1) if multi_pool is None else multi_pool
+    for pool in pools:
+        pool_df = sub[sub["patch_pool_id"] == pool]
+        pool_prefix = f"{pool}_" if is_multi_pool and pool else ""
+        for dataset in datasets:
+            ds_df = pool_df[pool_df["dataset"] == dataset]
+            if ds_df.empty:
                 continue
-            jitter = rng.uniform(-0.15, 0.15, size=len(vals))
-            ax.scatter(np.full(len(vals), idx) + jitter, vals, s=14, alpha=0.55)
-            win_frac = float(np.mean(vals < 0 if metric in LOWER_IS_BETTER_METRICS else vals > 0))
-            ax.text(idx, float(np.max(vals)), f"{win_frac:.0%}", ha="center", va="bottom", fontsize=8)
-        ax.axhline(0.0, color="gray", linestyle="--", linewidth=1.0)
-        ax.set_ylabel(f"Per-image delta ({metric})")
-        ax.set_title(f"{dataset}: Per-image {metric} delta vs baseline")
-        out_path = figures_dir / f"per_image_delta_distribution_{dataset}.png"
-        fig.savefig(out_path, dpi=120, bbox_inches="tight")
-        plt.close(fig)
-        created.append(out_path.name)
+            configs = [c for c in config_order if c in set(ds_df["config_id"])]
+            if not configs:
+                configs = sorted(ds_df["config_id"].unique())
+            series_list = [
+                ds_df.loc[ds_df["config_id"] == cfg, "mean_delta"].dropna().to_numpy(dtype=float) for cfg in configs
+            ]
+            series_list = [s[np.isfinite(s)] for s in series_list]
+            if not any(len(s) for s in series_list):
+                continue
+
+            fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * len(configs) + 1.5), 4.5))
+            ax.boxplot(series_list, showfliers=False)
+            ax.set_xticks(range(1, len(configs) + 1), configs)
+            rng = np.random.default_rng(0)
+            for idx, (cfg, vals) in enumerate(zip(configs, series_list), start=1):
+                if len(vals) == 0:
+                    continue
+                jitter = rng.uniform(-0.15, 0.15, size=len(vals))
+                ax.scatter(np.full(len(vals), idx) + jitter, vals, s=14, alpha=0.55)
+                win_frac = float(np.mean(vals < 0 if metric in LOWER_IS_BETTER_METRICS else vals > 0))
+                ax.text(idx, float(np.max(vals)), f"{win_frac:.0%}", ha="center", va="bottom", fontsize=8)
+            ax.axhline(0.0, color="gray", linestyle="--", linewidth=1.0)
+            ax.set_ylabel(f"Per-image delta ({metric})")
+            title_pool = f" [{pool}]" if is_multi_pool and pool else ""
+            ax.set_title(f"{dataset}: Per-image {metric} delta vs baseline{title_pool}")
+            out_path = figures_dir / f"per_image_delta_distribution_{pool_prefix}{dataset}.png"
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            created.append(out_path.name)
     return created
 
 
@@ -1022,38 +1045,50 @@ def _plot_learning_curves(
     figures_dir: Path,
     *,
     config_order: Sequence[str],
+    run_to_pool: dict[str, str] | None = None,
+    multi_pool: bool | None = None,
 ) -> list[str]:
     plt = _pyplot()
-    by_cfg: dict[str, list[list[float]]] = {}
-    for log in train_logs.values():
+    by_pool: dict[str, dict[str, list[list[float]]]] = {}
+    for run_id, log in train_logs.items():
         cfg = log.get("config_id")
         losses = log.get("epoch_losses")
         if cfg and isinstance(losses, list) and losses:
-            by_cfg.setdefault(str(cfg), []).append([float(x) for x in losses])
-    if not by_cfg:
+            pool = str(log.get("patch_pool_id") or (run_to_pool or {}).get(str(run_id), ""))
+            by_pool.setdefault(pool, {}).setdefault(str(cfg), []).append([float(x) for x in losses])
+    if not by_pool:
         return []
 
-    configs = [c for c in config_order if c in by_cfg] + sorted(c for c in by_cfg if c not in config_order)
-    fig, ax = plt.subplots(figsize=(7.0, 4.5))
-    for cfg in configs:
-        curves = by_cfg[cfg]
-        max_len = max(len(c) for c in curves)
-        padded = np.full((len(curves), max_len), np.nan, dtype=float)
-        for i, c in enumerate(curves):
-            padded[i, : len(c)] = c
-        epochs = np.arange(1, max_len + 1)
-        mean_curve = np.nanmean(padded, axis=0)
-        line = ax.plot(epochs, mean_curve, label=cfg, linewidth=1.8)[0]
-        if len(curves) > 1:
-            ax.fill_between(epochs, np.nanmin(padded, axis=0), np.nanmax(padded, axis=0), color=line.get_color(), alpha=0.15)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Training Loss")
-    ax.set_title("Training Loss Curves (mean across seeds)")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))
-    out_path = figures_dir / "learning_curves.png"
-    fig.savefig(out_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    return [out_path.name]
+    is_multi_pool = (len(by_pool) > 1) if multi_pool is None else multi_pool
+    created: list[str] = []
+    for pool in sorted(by_pool):
+        by_cfg = by_pool[pool]
+        configs = [c for c in config_order if c in by_cfg] + sorted(c for c in by_cfg if c not in config_order)
+        fig, ax = plt.subplots(figsize=(7.0, 4.5))
+        for cfg in configs:
+            curves = by_cfg[cfg]
+            max_len = max(len(c) for c in curves)
+            padded = np.full((len(curves), max_len), np.nan, dtype=float)
+            for i, c in enumerate(curves):
+                padded[i, : len(c)] = c
+            epochs = np.arange(1, max_len + 1)
+            mean_curve = np.nanmean(padded, axis=0)
+            line = ax.plot(epochs, mean_curve, label=cfg, linewidth=1.8)[0]
+            if len(curves) > 1:
+                ax.fill_between(
+                    epochs, np.nanmin(padded, axis=0), np.nanmax(padded, axis=0), color=line.get_color(), alpha=0.15
+                )
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Training Loss")
+        title_pool = f" [{pool}]" if is_multi_pool and pool else ""
+        ax.set_title(f"Training Loss Curves (mean across seeds){title_pool}")
+        ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))
+        out_name = f"learning_curves_{pool}.png" if is_multi_pool and pool else "learning_curves.png"
+        out_path = figures_dir / out_name
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        created.append(out_name)
+    return created
 
 
 def _pick_canonical_runs(summary_df: pd.DataFrame) -> dict[str, dict[str, str]]:
@@ -1239,20 +1274,27 @@ def _find_weights_path(runs_dir: Path, checkpoint_dir: Path | None, run_id: str)
     return fallback if fallback.is_file() else None
 
 
+def _format_signed_delta(value: float) -> str:
+    if math.isinf(value):
+        return "+inf" if value > 0 else "-inf"
+    return f"{value:+.3f}"
+
+
 def _render_case_study_figures(
     runs_dir: Path,
     figures_dir: Path,
     case_studies_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
+    per_image_seed_deltas: pd.DataFrame,
     *,
     data_dir: Path,
     checkpoint_dir: Path | None,
     experiments: dict[str, dict[str, Any]],
     scale: int,
     shave_border: int,
-) -> list[str]:
+    multi_pool: bool,
+) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
     if case_studies_df.empty:
-        return []
+        return [], [], []
     import torch
 
     from sr_pipeline.common.bicubic import bicubic_resize
@@ -1261,8 +1303,6 @@ def _render_case_study_figures(
     from sr_pipeline.models.espcn import ESPCN
 
     datasets_cache: dict[str, tuple[TestsetDataset, dict[str, int]]] = {}
-    canonical_by_pool = _pick_canonical_runs(summary_df)
-    multi_pool = len(canonical_by_pool) > 1
     models_cache: dict[str, ESPCN] = {}
 
     def _get_model(cfg: str, run_id: str) -> ESPCN | None:
@@ -1279,22 +1319,87 @@ def _render_case_study_figures(
         return model
 
     created: list[str] = []
+    rendered_records: list[dict[str, Any]] = []
+    skipped_records: list[dict[str, Any]] = []
     for row in case_studies_df.itertuples(index=False):
         pool = str(row.patch_pool_id)
-        canonical = canonical_by_pool.get(pool, {})
         ds_name, image_id, cfg, case_type = str(row.dataset), str(row.image_id), str(row.config_id), str(row.case_type)
-        if cfg not in canonical:
-            continue
-        target_model = _get_model(cfg, canonical[cfg])
-        if target_model is None:
+        metric = str(row.metric)
+        paired_rows = per_image_seed_deltas[
+            (per_image_seed_deltas["patch_pool_id"] == pool)
+            & (per_image_seed_deltas["dataset"] == ds_name)
+            & (per_image_seed_deltas["config_id"] == cfg)
+            & (per_image_seed_deltas["image_id"] == image_id)
+            & (per_image_seed_deltas["metric"] == metric)
+        ].sort_values("seed")
+
+        chosen_pair: tuple[int, str, str, ESPCN, ESPCN] | None = None
+        missing_details: list[str] = []
+        for pair in paired_rows.itertuples(index=False):
+            seed_val = int(pair.seed)
+            t_run_id = str(pair.run_id)
+            b_run_id = str(pair.baseline_run_id)
+            t_model = _get_model(cfg, t_run_id)
+            b_model = _get_model(BASELINE_CONFIG_ID, b_run_id)
+            if t_model is not None and b_model is not None:
+                chosen_pair = (seed_val, t_run_id, b_run_id, t_model, b_model)
+                break
+            missing_sides: list[str] = []
+            if t_model is None:
+                missing_sides.append(t_run_id)
+            if b_model is None:
+                missing_sides.append(b_run_id)
+            missing_details.append(f"seed={seed_val}({', '.join(missing_sides)} 체크포인트 없음)")
+
+        if chosen_pair is None:
+            reason = (
+                "짝지어진 시드 쌍의 체크포인트가 없습니다: " + "; ".join(missing_details)
+                if missing_details
+                else "Δ 계산에 참여한 시드 쌍을 찾지 못했습니다."
+            )
+            skipped_records.append(
+                {
+                    "patch_pool_id": pool,
+                    "config_id": cfg,
+                    "dataset": ds_name,
+                    "image_id": image_id,
+                    "case_type": case_type,
+                    "reason": reason,
+                }
+            )
             continue
 
         if ds_name not in datasets_cache:
-            ds = TestsetDataset(data_dir, ds_name)
+            try:
+                ds = TestsetDataset(data_dir, ds_name)
+            except ValueError as error:
+                skipped_records.append(
+                    {
+                        "patch_pool_id": pool,
+                        "config_id": cfg,
+                        "dataset": ds_name,
+                        "image_id": image_id,
+                        "case_type": case_type,
+                        "reason": str(error),
+                    }
+                )
+                continue
             datasets_cache[ds_name] = (ds, {img_id: idx for idx, img_id in enumerate(ds.image_ids)})
         ds, id_map = datasets_cache[ds_name]
         if image_id not in id_map:
+            skipped_records.append(
+                {
+                    "patch_pool_id": pool,
+                    "config_id": cfg,
+                    "dataset": ds_name,
+                    "image_id": image_id,
+                    "case_type": case_type,
+                    "reason": f"테스트셋 {ds_name}에 영상 {image_id!r}가 없습니다.",
+                }
+            )
             continue
+
+        seed_val, target_run_id, baseline_run_id, target_model, base_model = chosen_pair
         sample = ds[id_map[image_id]]
         lr, hr = sample["lr"], sample["hr"]
         hr_u8 = _display_u8(hr)
@@ -1308,18 +1413,18 @@ def _render_case_study_figures(
 
         with torch.inference_mode():
             bic_u8 = _display_u8(bicubic_resize(lr, float(scale)))
-            panels: list[_ComparisonPanel] = [_ComparisonPanel("bicubic", bic_u8, _zoom(bic_u8))]
-            if BASELINE_CONFIG_ID in canonical:
-                base_model = _get_model(BASELINE_CONFIG_ID, canonical[BASELINE_CONFIG_ID])
-                if base_model is not None:
-                    base_u8 = _display_u8(base_model(lr))
-                    panels.append(_ComparisonPanel(BASELINE_CONFIG_ID, base_u8, _zoom(base_u8)))
+            base_u8 = _display_u8(base_model(lr))
             target_u8 = _display_u8(target_model(lr))
-            panels.append(_ComparisonPanel(cfg, target_u8, _zoom(target_u8)))
+            panels: list[_ComparisonPanel] = [
+                _ComparisonPanel("bicubic", bic_u8, _zoom(bic_u8)),
+                _ComparisonPanel(f"{BASELINE_CONFIG_ID}\n({baseline_run_id})", base_u8, _zoom(base_u8)),
+                _ComparisonPanel(f"{cfg}\n({target_run_id})", target_u8, _zoom(target_u8)),
+            ]
 
         pool_prefix = f"{pool}_" if multi_pool else ""
         comp_name = f"case_study_comparison_{pool_prefix}{cfg}_{ds_name}_{image_id}_{case_type}.png"
         err_name = f"case_study_error_maps_{pool_prefix}{cfg}_{ds_name}_{image_id}_{case_type}.png"
+        delta_str = _format_signed_delta(float(row.mean_delta))
         _render_multi_config_panels(
             panels,
             hr_u8,
@@ -1327,10 +1432,24 @@ def _render_case_study_figures(
             shave_border=shave_border,
             comparison_path=figures_dir / comp_name,
             error_maps_path=figures_dir / err_name,
-            title=f"{ds_name} {image_id} ({cfg} {case_type}, delta={row.mean_delta:+.3f} dB)",
+            title=f"{ds_name} {image_id} ({cfg} {case_type}, seed={seed_val}, delta={delta_str} dB)",
         )
         created.extend([comp_name, err_name])
-    return created
+        rendered_records.append(
+            {
+                "comparison_figure": comp_name,
+                "error_maps_figure": err_name,
+                "patch_pool_id": pool,
+                "config_id": cfg,
+                "dataset": ds_name,
+                "image_id": image_id,
+                "case_type": case_type,
+                "seed": seed_val,
+                "run_id": target_run_id,
+                "baseline_run_id": baseline_run_id,
+            }
+        )
+    return created, rendered_records, skipped_records
 
 
 def export_report_assets(
@@ -1341,6 +1460,7 @@ def export_report_assets(
     experiments_config_path: Path = DEFAULT_EXPERIMENTS_CONFIG,
     data_dir: Path | None = None,
     checkpoint_dir: Path | None = None,
+    allowed_run_ids: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """표(CSV/Markdown), 분포 그림, 다중 구성 비교 그림, 학습 곡선, 진행 현황 표를 내보냅니다."""
     runs_dir = Path(runs_dir)
@@ -1352,7 +1472,7 @@ def export_report_assets(
     max_hours = float(fair["fixed_rules"]["max_hours"])
     config_order, promoted_configs, experiments = _load_experiments_metadata(experiments_config_path)
 
-    summary_df, per_image_df = load_run_records(runs_dir)
+    summary_df, per_image_df = load_run_records(runs_dir, allowed_run_ids=allowed_run_ids)
     validate_unique_runs(summary_df)
     result_tables = compute_result_tables(summary_df, expected_seeds=expected_seeds)
     formatted_results = format_result_report_table(result_tables["results"])
@@ -1431,11 +1551,18 @@ def export_report_assets(
         per_image_tables["per_image_summary"].to_csv(tables_dir / "per_image_summary.csv", index=False)
         per_image_tables["per_image_seed_deltas"].to_csv(tables_dir / "per_image_seed_deltas.csv", index=False)
 
+        multi_pool = summary_df["patch_pool_id"].nunique() > 1
+        run_to_pool = {
+            str(r.run_id): str(r.patch_pool_id)
+            for r in summary_df[["run_id", "patch_pool_id"]].drop_duplicates().itertuples(index=False)
+        }
         figures_created: list[str] = []
         figures_created += _plot_per_image_delta_distributions(
-            per_image_summary, figures_dir, config_order=config_order
+            per_image_summary, figures_dir, config_order=config_order, multi_pool=multi_pool
         )
-        figures_created += _plot_learning_curves(train_logs, figures_dir, config_order=config_order)
+        figures_created += _plot_learning_curves(
+            train_logs, figures_dir, config_order=config_order, run_to_pool=run_to_pool, multi_pool=multi_pool
+        )
         figures_created += _render_representative_comparisons(
             runs_dir,
             figures_dir,
@@ -1444,30 +1571,52 @@ def export_report_assets(
             config_order=config_order,
             shave_border=shave_border,
         )
+        rendered_case_records: list[dict[str, Any]] = []
+        skipped_case_records: list[dict[str, Any]] = []
         case_study_note = None
         if data_dir is not None:
-            case_figs = _render_case_study_figures(
+            case_figs, rendered_case_records, skipped_case_records = _render_case_study_figures(
                 runs_dir,
                 figures_dir,
                 case_studies_df,
-                summary_df,
+                per_image_tables["per_image_seed_deltas"],
                 data_dir=Path(data_dir),
                 checkpoint_dir=Path(checkpoint_dir) if checkpoint_dir is not None else None,
                 experiments=experiments,
                 scale=scale,
                 shave_border=shave_border,
+                multi_pool=multi_pool,
             )
             figures_created += case_figs
-            if not case_studies_df.empty and not case_figs:
-                case_study_note = "체크포인트(weights.pt)를 찾지 못해 사례 영상 비교·오차 지도를 생성하지 못했습니다."
+            if skipped_case_records and not case_figs:
+                case_study_note = "짝지어진 시드의 체크포인트(weights.pt)를 찾지 못해 사례 영상 비교·오차 지도를 생성하지 못했습니다."
+            elif skipped_case_records:
+                case_study_note = (
+                    f"사례 영상 {len(skipped_case_records)}건은 짝지어진 시드 체크포인트 또는 테스트셋 영상을 찾지 못해 건너뛰었습니다."
+                )
         elif not case_studies_df.empty:
             case_study_note = "--data-dir이 지정되지 않아 사례 영상 비교·오차 지도 그림을 건너뛰었습니다."
+            skipped_case_records = [
+                {
+                    "patch_pool_id": str(row.patch_pool_id),
+                    "config_id": str(row.config_id),
+                    "dataset": str(row.dataset),
+                    "image_id": str(row.image_id),
+                    "case_type": str(row.case_type),
+                    "reason": "--data-dir이 지정되지 않음",
+                }
+                for row in case_studies_df.itertuples(index=False)
+            ]
 
         manifest: dict[str, Any] = {
             "run_ids": sorted(str(r) for r in summary_df["run_id"].unique()),
             "tables": sorted(p.name for p in tables_dir.iterdir() if p.is_file()),
             "figures": sorted(figures_created),
         }
+        if rendered_case_records:
+            manifest["case_study_figures"] = rendered_case_records
+        if skipped_case_records:
+            manifest["skipped_case_study_figures"] = skipped_case_records
         if case_study_note is not None:
             manifest["case_study_figures_skipped_reason"] = case_study_note
         (staging_root / "manifest.json").write_text(

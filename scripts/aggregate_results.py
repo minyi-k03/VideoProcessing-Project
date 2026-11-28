@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from sr_pipeline.reporting.aggregate import export_report_assets
@@ -56,31 +57,60 @@ def _git(repo_root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def verify_runs_merged_to_main(runs_dir: Path, *, main_ref: str = "main", repo_root: Path = REPO_ROOT) -> None:
-    """`runs_dir`의 모든 실행 기록이 `main_ref` 브랜치와 100% 일치하는지 검증합니다."""
-    resolved_runs = Path(runs_dir).resolve()
-    repo_top = Path(_git(repo_root, "rev-parse", "--show-toplevel")).resolve()
+def _repo_relative(path: Path, repo_top: Path, *, label: str, main_ref: str) -> str:
+    resolved = Path(path).resolve()
     try:
-        rel_runs = resolved_runs.relative_to(repo_top).as_posix()
+        return resolved.relative_to(repo_top).as_posix()
     except ValueError as error:
         raise RuntimeError(
-            f"실행 기록 폴더({resolved_runs})가 git 저장소 밖에 있어 {main_ref} 병합 여부를 확인할 수 없습니다. "
+            f"{label}({resolved})가 git 저장소 밖에 있어 {main_ref} 병합 여부를 확인할 수 없습니다. "
             "미리보기용이면 --allow-unmerged와 별도 --output-dir을 지정하세요."
         ) from error
 
+
+def _main_ref_run_ids(repo_top: Path, rel_runs: str, main_ref: str) -> set[str]:
+    """`main_ref` 트리의 `rel_runs/<run_id>/...`에 실제로 병합된 실행 ID 목록을 돌려줍니다."""
+    listed = _git(repo_top, "ls-tree", "-r", "--name-only", main_ref, "--", rel_runs)
+    run_ids: set[str] = set()
+    rel_prefix = Path(rel_runs)
+    for line in listed.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = Path(line).relative_to(rel_prefix).parts
+        if len(parts) >= 2:
+            run_ids.add(parts[0])
+    return run_ids
+
+
+def verify_runs_merged_to_main(
+    runs_dir: Path,
+    *,
+    main_ref: str = "main",
+    repo_root: Path = REPO_ROOT,
+    config_paths: Sequence[Path] = (),
+) -> set[str]:
+    """`runs_dir`과 설정 파일이 `main_ref` 브랜치와 100% 일치하는지 검증하고 병합된 `run_id` 집합을 돌려줍니다."""
+    repo_top = Path(_git(repo_root, "rev-parse", "--show-toplevel")).resolve()
+    rel_runs = _repo_relative(runs_dir, repo_top, label="실행 기록 폴더", main_ref=main_ref)
+    rel_configs = [_repo_relative(path, repo_top, label="설정 파일", main_ref=main_ref) for path in config_paths]
+
     _git(repo_top, "rev-parse", "--verify", main_ref)
-    dirty = _git(repo_top, "status", "--porcelain", "--untracked-files=all", "--", rel_runs)
-    if dirty:
-        raise RuntimeError(
-            f"{rel_runs}에 커밋되지 않았거나 추적되지 않은 실행 기록이 있습니다. "
-            f"커밋 및 {main_ref} 병합 후 집계하세요:\n{dirty}"
-        )
-    diff = _git(repo_top, "diff", "--name-status", main_ref, "--", rel_runs)
-    if diff:
-        raise RuntimeError(
-            f"{rel_runs}가 {main_ref} 브랜치에 병합된 실행 기록과 다릅니다"
-            f"(미병합 실행이 있거나 {main_ref} 최신 병합 기록이 빠져 있습니다):\n{diff}"
-        )
+    for rel_path, kind in [(rel_runs, "실행 기록"), *[(p, "설정 파일") for p in rel_configs]]:
+        # `--ignored`로 `.git/info/exclude`·`.gitignore`에 숨긴 미병합 파일까지 모두 탐지한다.
+        dirty = _git(repo_top, "status", "--porcelain", "--untracked-files=all", "--ignored", "--", rel_path)
+        if dirty:
+            raise RuntimeError(
+                f"{rel_path}에 커밋되지 않았거나 추적/제외(.gitignore·.git/info/exclude)된 {kind}이 있습니다. "
+                f"커밋 및 {main_ref} 병합 후 집계하세요:\n{dirty}"
+            )
+        diff = _git(repo_top, "diff", "--name-status", main_ref, "--", rel_path)
+        if diff:
+            raise RuntimeError(
+                f"{rel_path}가 {main_ref} 브랜치에 병합된 {kind}과 다릅니다"
+                f"(미병합 변경이 있거나 {main_ref} 최신 병합 기록이 빠져 있습니다):\n{diff}"
+            )
+    return _main_ref_run_ids(repo_top, rel_runs, main_ref)
 
 
 def _check_output_target(
@@ -121,8 +151,14 @@ def main(argv: list[str] | None = None) -> None:
     experiments_config = args.experiments_config if args.experiments_config is not None else DEFAULT_EXPERIMENTS_CONFIG
 
     _check_output_target(output_dir, runs_dir, fair_config, experiments_config, args.allow_unmerged, args.main_ref)
+    allowed_run_ids: set[str] | None = None
     if not args.allow_unmerged:
-        verify_runs_merged_to_main(runs_dir, main_ref=args.main_ref, repo_root=REPO_ROOT)
+        allowed_run_ids = verify_runs_merged_to_main(
+            runs_dir,
+            main_ref=args.main_ref,
+            repo_root=REPO_ROOT,
+            config_paths=(fair_config, experiments_config),
+        )
 
     manifest = export_report_assets(
         runs_dir,
@@ -131,6 +167,7 @@ def main(argv: list[str] | None = None) -> None:
         experiments_config_path=experiments_config,
         data_dir=args.data_dir,
         checkpoint_dir=args.checkpoint_dir,
+        allowed_run_ids=allowed_run_ids,
     )
     print(f"aggregated {len(manifest['run_ids'])} runs -> {len(manifest['tables'])} tables, {len(manifest['figures'])} figures")
 

@@ -182,3 +182,46 @@ def test_non_default_configs_refuse_default_output_dir(git_repo: Path, cli: Modu
 def test_non_main_ref_refuses_default_output_dir(git_repo: Path, cli: ModuleType) -> None:
     with pytest.raises(ValueError, match="results/aggregated"):
         cli.main(["--main-ref", "HEAD"])
+
+
+def test_rejects_git_info_exclude_unmerged_run_in_runs_dir(git_repo: Path, cli: ModuleType) -> None:
+    _write_run(git_repo / "results" / "runs", "A", 0, 35.0)
+    exclude_file = git_repo / ".git" / "info" / "exclude"
+    exclude_file.parent.mkdir(parents=True, exist_ok=True)
+    exclude_file.write_text("results/runs/c0-A-s0/\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="main"):
+        cli.main([])
+    assert not (git_repo / "results" / "aggregated" / "tables").exists()
+
+
+def test_rejects_locally_modified_fair_config(git_repo: Path, cli: ModuleType) -> None:
+    fair_path = git_repo / "configs" / "fair_comparison.yaml"
+    fair_path.write_text(fair_path.read_text(encoding="utf-8").replace("max_hours: 3.0", "max_hours: 9.0"), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="설정 파일"):
+        cli.main([])
+    assert not (git_repo / "results" / "aggregated" / "tables").exists()
+
+
+def test_rejects_unmerged_fair_config_on_feature_branch(git_repo: Path, cli: ModuleType) -> None:
+    _git(git_repo, "checkout", "-q", "-b", "YongMin")
+    fair_path = git_repo / "configs" / "fair_comparison.yaml"
+    fair_path.write_text(fair_path.read_text(encoding="utf-8").replace("max_hours: 3.0", "max_hours: 9.0"), encoding="utf-8")
+    _git(git_repo, "add", "configs/fair_comparison.yaml")
+    _git(git_repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "edit max_hours")
+
+    with pytest.raises(RuntimeError, match="main"):
+        cli.main([])
+    assert not (git_repo / "results" / "aggregated" / "tables").exists()
+
+
+def test_load_run_records_restricts_to_allowed_run_ids(tmp_path: Path) -> None:
+    from sr_pipeline.reporting.aggregate import load_run_records
+
+    runs_dir = tmp_path / "runs"
+    _write_run(runs_dir, "baseline", 0, 30.0)
+    _write_run(runs_dir, "A", 0, 31.0)
+    summary, per_image = load_run_records(runs_dir, allowed_run_ids={"c0-baseline-s0"})
+    assert set(summary["run_id"]) == {"c0-baseline-s0"}
+    assert set(per_image["run_id"]) == {"c0-baseline-s0"}
