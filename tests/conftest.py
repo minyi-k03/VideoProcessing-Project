@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import torch
 
+pytest_plugins = ("experiment_fixtures",)
+
 
 @pytest.fixture
 def restore_global_random_state() -> Iterator[None]:
