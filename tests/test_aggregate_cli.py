@@ -286,3 +286,41 @@ def test_allows_korean_image_filenames_merged_in_main(git_repo: Path, cli: Modul
     cli.main([])
 
     assert (git_repo / "results" / "aggregated" / "figures" / "comparison_Set14_나비_median.png").is_file()
+
+
+def test_ignores_main_tag_and_pins_refs_heads_main(git_repo: Path, cli: ModuleType) -> None:
+    _git(git_repo, "checkout", "-q", "-b", "YongMin")
+    for s in SEEDS:
+        _write_run(git_repo / "results" / "runs", "A", s, 31.0)
+    _git(git_repo, "add", "results/runs")
+    _git(git_repo, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "unmerged A")
+    # 동명의 main 태그가 YongMin을 가리켜도 refs/heads/main에 없는 실행 A는 거부돼야 한다.
+    _git(git_repo, "tag", "main")
+
+    with pytest.raises(RuntimeError, match="main"):
+        cli.main([])
+
+    # 반대로 refs/heads/main 위에서도 main 태그가 다른 커밋을 가리킬 때 refs/heads/main만 집계해야 한다.
+    _git(git_repo, "checkout", "-q", "main")
+    cli.main([])
+    results_df = pd.read_csv(git_repo / "results" / "aggregated" / "tables" / "results.csv")
+    assert set(results_df["config_id"]) == {"baseline"}
+
+
+def test_ignores_git_replace_objects_during_official_aggregation(git_repo: Path, cli: ModuleType) -> None:
+    csv_path = git_repo / "results" / "runs" / "c0-baseline-s0" / "summary.csv"
+    orig_sha = _git(git_repo, "ls-tree", "refs/heads/main", "results/runs/c0-baseline-s0/summary.csv").split()[2]
+    fake_csv = csv_path.read_text(encoding="utf-8").replace(",30.0,", ",99.0,")
+    fake_sha = subprocess.run(
+        ["git", "-C", str(git_repo), "hash-object", "-w", "--stdin"],
+        input=fake_csv,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git(git_repo, "replace", orig_sha, fake_sha)
+
+    cli.main([])
+    results_df = pd.read_csv(git_repo / "results" / "aggregated" / "tables" / "results.csv")
+    psnr_mean = results_df[(results_df["config_id"] == "baseline") & (results_df["metric"] == "psnr_y")]["mean"].iloc[0]
+    assert psnr_mean == pytest.approx(30.0)

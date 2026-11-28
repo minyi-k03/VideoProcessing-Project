@@ -44,7 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _git_bytes(repo_root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_root), "-c", "core.quotePath=false", *args],
+            ["git", "--no-replace-objects", "-C", str(repo_root), "-c", "core.quotePath=false", *args],
             input=input_bytes,
             capture_output=True,
             check=True,
@@ -170,6 +170,12 @@ def _main_ref_run_ids(entries: Sequence[tuple[str, str, str]], rel_runs: str) ->
     return run_ids
 
 
+def _resolve_main_commit(repo_top: Path, main_ref: str) -> str:
+    """`main`은 동명의 태그가 아닌 `refs/heads/main` 브랜치 커밋 SHA로 고정해 해석합니다."""
+    exact_ref = "refs/heads/main" if main_ref == "main" else main_ref
+    return _git(repo_top, "rev-parse", "--verify", f"{exact_ref}^{{commit}}")
+
+
 def verify_runs_merged_to_main(
     runs_dir: Path,
     *,
@@ -183,7 +189,7 @@ def verify_runs_merged_to_main(
     rel_runs = _repo_relative(runs_dir, repo_top, label="실행 기록 폴더", main_ref=main_ref)
     rel_configs = [_repo_relative(path, repo_top, label="설정 파일", main_ref=main_ref) for path in config_paths]
 
-    _git(repo_top, "rev-parse", "--verify", main_ref)
+    main_sha = _resolve_main_commit(repo_top, main_ref)
     for rel_path, kind in [(rel_runs, "실행 기록"), *[(p, "설정 파일") for p in rel_configs]]:
         # `--ignored`로 `.git/info/exclude`·`.gitignore`에 숨긴 미병합 파일까지 모두 탐지한다.
         dirty = _git_bytes(repo_top, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored", "--", rel_path)
@@ -193,7 +199,7 @@ def verify_runs_merged_to_main(
                 f"{rel_path}에 커밋되지 않았거나 추적/제외(.gitignore·.git/info/exclude)된 {kind}이 있습니다. "
                 f"커밋 및 {main_ref} 병합 후 집계하세요:\n{dirty_text}"
             )
-        diff = _git_bytes(repo_top, "diff", "--name-status", "-z", main_ref, "--", rel_path)
+        diff = _git_bytes(repo_top, "diff", "--name-status", "-z", main_sha, "--", rel_path)
         if diff:
             diff_text = diff.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
             raise RuntimeError(
@@ -202,14 +208,14 @@ def verify_runs_merged_to_main(
             )
 
     all_paths = [rel_runs, *rel_configs]
-    entries = _list_main_tree_entries(repo_top, all_paths, main_ref)
+    entries = _list_main_tree_entries(repo_top, all_paths, main_sha)
     entry_paths = {p for _m, _s, p in entries}
     for rel_cfg in rel_configs:
         if rel_cfg not in entry_paths:
             raise RuntimeError(f"{main_ref} 브랜치에 필수 설정 파일이 없습니다: {rel_cfg}")
-    _verify_worktree_blobs(repo_top, entries, main_ref)
+    _verify_worktree_blobs(repo_top, entries, main_sha)
     if snapshot_dir is not None:
-        _extract_snapshot(repo_top, entries, main_ref, snapshot_dir)
+        _extract_snapshot(repo_top, entries, main_sha, snapshot_dir)
     return _main_ref_run_ids(entries, rel_runs)
 
 
@@ -227,7 +233,7 @@ def _check_output_target(
     is_default_target = resolved_out == default_out or default_out in resolved_out.parents
     if not is_default_target:
         return
-    if allow_unmerged or main_ref != "main":
+    if allow_unmerged or main_ref not in ("main", "refs/heads/main"):
         raise ValueError(
             "공식 집계 폴더(results/aggregated/)에는 main 기준 검증을 통과한 집계만 쓸 수 있습니다"
             "(--allow-unmerged 또는 --main-ref 변경 시 별도 --output-dir을 지정하세요)."

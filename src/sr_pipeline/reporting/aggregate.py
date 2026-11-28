@@ -1329,6 +1329,15 @@ def _format_signed_delta(value: float) -> str:
     return f"{value:+.3f}"
 
 
+def _json_metric_value(value: float) -> float | str | None:
+    """표준 JSON(RFC 8259)을 지키기 위해 유한값은 숫자로, 무한대는 `"+inf"`/`"-inf"`로 변환합니다."""
+    if math.isnan(value):
+        return None
+    if math.isinf(value):
+        return "+inf" if value > 0 else "-inf"
+    return float(value)
+
+
 def _render_case_study_figures(
     runs_dir: Path,
     figures_dir: Path,
@@ -1495,8 +1504,8 @@ def _render_case_study_figures(
                 "image_id": image_id,
                 "case_type": case_type,
                 "seed": seed_val,
-                "seed_delta": seed_delta,
-                "mean_delta": float(row.mean_delta),
+                "seed_delta": _json_metric_value(seed_delta),
+                "mean_delta": _json_metric_value(float(row.mean_delta)),
                 "run_id": target_run_id,
                 "baseline_run_id": baseline_run_id,
             }
@@ -1672,7 +1681,7 @@ def export_report_assets(
         if case_study_note is not None:
             manifest["case_study_figures_skipped_reason"] = case_study_note
         (staging_root / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8"
         )
 
         output_dir.mkdir(parents=True, exist_ok=True)

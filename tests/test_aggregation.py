@@ -1202,3 +1202,51 @@ class TestExportReportAssets:
 
         with pytest.raises(ValueError, match="patch_pool_id"):
             export_report_assets(runs_dir, out_dir)
+
+    def test_manifest_json_serializes_infinite_deltas_as_strict_json_strings(self, tmp_path: Path) -> None:
+        import json
+        import numpy as np
+        import torch
+        from PIL import Image
+        from sr_pipeline.data.prepare import prepare_testsets
+        from sr_pipeline.models.espcn import ESPCN
+
+        runs_dir = tmp_path / "runs"
+        out_dir = tmp_path / "aggregated"
+        for cfg, img_psnr in (("baseline", 30.0), ("A", math.inf)):
+            run_id = f"c0-{cfg}-s0"
+            run_dir = runs_dir / run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([_row(cfg, 0, img_psnr, dataset="BSD100")], columns=SUMMARY_COLUMNS).to_csv(
+                run_dir / "summary.csv", index=False
+            )
+            per_img = [
+                {"run_id": run_id, "dataset": "BSD100", "image_id": "b0", "psnr_y": img_psnr,
+                 "ssim_y": 1.0 if math.isinf(img_psnr) else 0.9, "psnr_rgb": img_psnr, "edge_psnr": img_psnr, "lpips": 0.0},
+                {"run_id": run_id, "dataset": "BSD100", "image_id": "b1", "psnr_y": 30.0,
+                 "ssim_y": 0.9, "psnr_rgb": 28.0, "edge_psnr": 25.0, "lpips": 0.1},
+            ]
+            pd.DataFrame(per_img, columns=PER_IMAGE_COLUMNS).to_csv(run_dir / "per_image.csv", index=False)
+            ckpt_dir = tmp_path / "ckpts" / run_id
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(ESPCN().state_dict(), ckpt_dir / "weights.pt")
+
+        hr_root = tmp_path / "hr_src"
+        (hr_root / "BSD100").mkdir(parents=True)
+        for img_id in ("b0", "b1"):
+            Image.fromarray(np.full((32, 32, 3), 120, dtype=np.uint8)).save(hr_root / "BSD100" / f"{img_id}.png")
+        data_dir = tmp_path / "data"
+        prepare_testsets(hr_root, data_dir, 4, ["BSD100"], "bicubic", "matlab_imresize_antialias")
+
+        manifest = export_report_assets(runs_dir, out_dir, data_dir=data_dir, checkpoint_dir=tmp_path / "ckpts")
+
+        def _reject_nonstandard(token: str) -> None:
+            raise ValueError(f"Non-standard JSON constant: {token}")
+
+        parsed = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"), parse_constant=_reject_nonstandard)
+        b0_rec = [r for r in parsed["case_study_figures"] if r["image_id"] == "b0"][0]
+        assert b0_rec["seed_delta"] == "+inf"
+        assert b0_rec["mean_delta"] == "+inf"
+        b1_rec = [r for r in parsed["case_study_figures"] if r["image_id"] == "b1"][0]
+        assert isinstance(b1_rec["seed_delta"], float) and b1_rec["seed_delta"] == pytest.approx(0.0)
+        assert manifest == parsed
