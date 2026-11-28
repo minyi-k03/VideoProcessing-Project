@@ -58,9 +58,19 @@ def test_all_configs_run_end_to_end_on_tiny_synthetic_data(
         assert train_log["epochs_done"] == train_log["epochs_total"] == 1
 
 
-@pytest.mark.skip(
-    reason="Needs evaluation.evaluator (T3.6) for metric-level reproducibility (T3.9); "
-    "training-level reproducibility (weights, losses, resume) is covered by tests/test_trainer.py"
-)
-def test_same_config_and_seed_reproducible() -> None:
-    """같은 구성·시드를 두 번 실행하면 동일한 지표를 얻어야 합니다."""
+def test_same_config_and_seed_reproducible(
+    cli: ModuleType, tmp_path: Path, fair_path: Path, prepared_data: Path
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for root in (first, second):
+        cli.main(args_for(root, fair_path, config="AB", seed=0, data_dir=prepared_data))
+    first_run, second_run = only_run_dir(first / "records"), only_run_dir(second / "records")
+
+    timing = ["train_minutes", "infer_ms_net", "infer_ms_total"]
+    first_summary = pd.read_csv(first_run / "summary.csv", float_precision="round_trip").drop(columns=timing)
+    second_summary = pd.read_csv(second_run / "summary.csv", float_precision="round_trip").drop(columns=timing)
+    pd.testing.assert_frame_equal(first_summary, second_summary, check_exact=True)
+
+    first_per_image = pd.read_csv(first_run / "per_image.csv", float_precision="round_trip")
+    second_per_image = pd.read_csv(second_run / "per_image.csv", float_precision="round_trip")
+    pd.testing.assert_frame_equal(first_per_image, second_per_image, check_exact=True)
